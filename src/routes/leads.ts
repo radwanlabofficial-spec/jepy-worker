@@ -125,25 +125,96 @@ leadRoutes.get('/leads', async (c) => {
 // the parameterised route first the literal segment "stats" is captured as an
 // id and the endpoint answers 404 — which is exactly what happened on the first
 // deploy.
+/**
+ * The Overview's numbers, in one round trip.
+ *
+ * `mtd_budget_micro` is a code constant rather than a stored setting: the monthly
+ * cash ceiling appears in 17-budget.md but was never given a `settings` key, and
+ * the schema is frozen (ADR-028). It lives here, labelled, until an ADR moves it.
+ */
+const MONTHLY_BUDGET_MICRO = 70_000_000; // $70
+
 leadRoutes.get('/leads/stats', async (c) => {
-  const [tiers, totals] = await c.env.DB.batch<Record<string, unknown>>([
+  const [tiers, totals, verified, queue, bdToday, mtd, errors, aiToday, config] =
+    await c.env.DB.batch<Record<string, unknown>>([
     c.env.DB.prepare(
       `SELECT COALESCE(tier, 'provisional') AS bucket, COUNT(*) AS n
          FROM leads WHERE deleted_at IS NULL GROUP BY bucket`,
     ),
     c.env.DB.prepare(
       `SELECT COUNT(*) AS total,
-              SUM(CASE WHEN created_at >= unixepoch() - 86400 THEN 1 ELSE 0 END) AS new_24h,
-              SUM(CASE WHEN stage = 'won' THEN 1 ELSE 0 END) AS won
+              COALESCE(SUM(CASE WHEN created_at >= unixepoch() - 86400 THEN 1 ELSE 0 END), 0) AS new_today,
+              COALESCE(SUM(CASE WHEN stage = 'won' THEN 1 ELSE 0 END), 0) AS won
          FROM leads WHERE deleted_at IS NULL`,
     ),
+    c.env.DB.prepare(
+      `SELECT COUNT(DISTINCT lead_id) AS verified_email FROM contacts WHERE verify_layer = 'L3'`,
+    ),
+    c.env.DB.prepare(
+      `SELECT COUNT(*) AS queue_depth,
+              COALESCE(SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), 0) AS running,
+              MIN(CASE WHEN status = 'pending' THEN created_at END) AS oldest_pending
+         FROM job_queue WHERE status IN ('pending','claimed','running')`,
+    ),
+    c.env.DB.prepare(
+      `SELECT COALESCE(SUM(credits), 0) AS bd_credits_today FROM brightdata_credit_log
+        WHERE created_at >= CAST(strftime('%s', date('now')) AS INTEGER)`,
+    ),
+    c.env.DB.prepare(
+      `SELECT
+         (SELECT COALESCE(SUM(cost_micro), 0) FROM brightdata_credit_log
+           WHERE created_at >= CAST(strftime('%s', date('now','start of month')) AS INTEGER))
+       + (SELECT COALESCE(SUM(cost_micro), 0) FROM apify_usage_log
+           WHERE created_at >= CAST(strftime('%s', date('now','start of month')) AS INTEGER)) AS mtd_cost_micro`,
+    ),
+    c.env.DB.prepare(
+      `SELECT COUNT(*) AS errors_24h FROM error_log WHERE created_at >= unixepoch() - 86400`,
+    ),
+    c.env.DB.prepare(
+      `SELECT COALESCE(SUM(lead_count), 0) AS ai_requests_today FROM ai_score_log
+        WHERE created_at >= unixepoch() - 86400`,
+    ),
+    c.env.DB.prepare(
+      `SELECT
+         (SELECT value_num FROM settings WHERE key = 'daily_bd_credit_guard') AS bd_daily_guard,
+         (SELECT value_num FROM settings WHERE key = 'ai_daily_cap')         AS ai_daily_cap,
+         (SELECT value_num FROM settings WHERE key = 'gate_threshold')       AS gate_threshold`,
+    ),
   ]);
-  if (!tiers || !totals) throw new Error('batch result count mismatch');
+  if (!tiers || !totals || !verified || !queue || !bdToday || !mtd || !errors || !aiToday || !config) {
+    throw new Error('batch result count mismatch');
+  }
 
   const byTier: Record<string, number> = {};
   for (const row of (tiers.results ?? []) as { bucket: string; n: number }[]) byTier[row.bucket] = row.n;
 
-  return c.json(ok({ by_tier: byTier, totals: (totals.results ?? [])[0] ?? null }));
+  const head = (totals.results ?? [])[0] ?? {};
+  const queueRow = (queue.results ?? [])[0] ?? {};
+  const oldest = queueRow.oldest_pending as number | null;
+  const configRow = (config.results ?? [])[0] ?? {};
+
+  // Flat and complete, because the Overview renders all fourteen cards from this
+  // one answer and a missing key there reads as a broken panel.
+  return c.json(
+    ok({
+      total: Number(head.total ?? 0),
+      by_tier: byTier,
+      new_today: Number(head.new_today ?? 0),
+      won: Number(head.won ?? 0),
+      verified_email: Number((verified.results ?? [])[0]?.verified_email ?? 0),
+      queue_depth: Number(queueRow.queue_depth ?? 0),
+      oldest_pending_sec: oldest ? Math.floor(Date.now() / 1000) - oldest : null,
+      running: Number(queueRow.running ?? 0),
+      bd_credits_today: Number((bdToday.results ?? [])[0]?.bd_credits_today ?? 0),
+      bd_daily_guard: Number(configRow.bd_daily_guard ?? 0),
+      mtd_cost_micro: Number((mtd.results ?? [])[0]?.mtd_cost_micro ?? 0),
+      mtd_budget_micro: MONTHLY_BUDGET_MICRO,
+      errors_24h: Number((errors.results ?? [])[0]?.errors_24h ?? 0),
+      ai_requests_today: Number((aiToday.results ?? [])[0]?.ai_requests_today ?? 0),
+      ai_daily_cap: Number(configRow.ai_daily_cap ?? 0),
+      gate_threshold: Number(configRow.gate_threshold ?? 0),
+    }),
+  );
 });
 
 leadRoutes.get('/leads/:id', async (c) => {

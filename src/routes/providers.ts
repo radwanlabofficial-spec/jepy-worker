@@ -170,9 +170,13 @@ providerRoutes.patch('/providers/accounts/:id', async (c) => {
 
 providerRoutes.get('/providers/accounts', async (c) => {
   const result = await c.env.DB.prepare(
-    `SELECT id, provider, account_label, quota_limit, quota_used, quota_window, quota_reset_at,
-            quota_expires_at, daily_used, daily_limit, status, cooldown_until, consecutive_errors,
-            plan_label, plan_price_micro, last_synced_at, sync_error, enabled, priority, last_used_at
+    `SELECT id, provider, account_label, quota_limit, quota_used,
+            -- The contract calls this quota_period; the column is quota_window.
+            quota_window AS quota_period,
+            quota_reset_at, quota_expires_at, daily_used, daily_limit, status, cooldown_until,
+            consecutive_errors, plan_label, plan_price_micro, last_synced_at, sync_error,
+            enabled, priority, last_used_at,
+            1 AS has_credential
        FROM provider_accounts
       ORDER BY provider ASC, account_label ASC`,
   ).all();
@@ -197,21 +201,40 @@ providerRoutes.get('/providers/capability', async (c) => {
 });
 
 providerRoutes.get('/providers/pools', async (c) => {
+  // Field names are the contract's (`account_count`, `quota_total`, `unit_type`
+  // …), derived in SQL so the pool tiles render without client-side guesswork.
+  // `unit_type` is the provider's own unit, because "5,000 of what?" is the
+  // question the tile exists to answer.
   const result = await c.env.DB.prepare(
     `SELECT provider,
-            COUNT(*) AS accounts,
+            COUNT(*) AS account_count,
             SUM(CASE WHEN enabled = 1 AND status = 'active' THEN 1 ELSE 0 END) AS active,
-            SUM(CASE WHEN status = 'invalid' THEN 1 ELSE 0 END) AS invalid,
+            SUM(CASE WHEN status = 'invalid' THEN 1 ELSE 0 END)      AS invalid,
             SUM(CASE WHEN status = 'rate_limited' THEN 1 ELSE 0 END) AS rate_limited,
-            SUM(CASE WHEN status = 'exhausted' THEN 1 ELSE 0 END) AS exhausted,
-            SUM(COALESCE(quota_limit, 0)) AS quota_limit,
-            SUM(COALESCE(quota_used, 0)) AS quota_used
+            SUM(CASE WHEN status = 'exhausted' THEN 1 ELSE 0 END)    AS exhausted,
+            COALESCE(SUM(COALESCE(quota_limit, 0)), 0) AS quota_total,
+            COALESCE(SUM(COALESCE(quota_used, 0)), 0)  AS quota_used,
+            CASE provider
+              WHEN 'brightdata' THEN 'credits'
+              WHEN 'apify'      THEN 'USD'
+              WHEN 'zerobounce' THEN 'verifications'
+              WHEN 'resend'     THEN 'emails'
+              WHEN 'yelp'       THEN 'calls/day'
+              WHEN 'google_psi' THEN 'requests/day'
+              ELSE 'requests'
+            END AS unit_type,
+            -- Keyless providers hold no credential at all, so the tile must not
+            -- offer a key that does not exist.
+            CASE WHEN provider IN ('google_psi','gha_runner') THEN 1 ELSE 0 END AS keyless,
+            -- Exactly one account, forever: a second Yelp account is a terms
+            -- problem, not a quota problem (R21).
+            CASE WHEN provider IN ('yelp','mapquest') THEN 1 ELSE 0 END AS single_account
        FROM provider_accounts
       GROUP BY provider
       ORDER BY provider ASC`,
   ).all();
 
-  // The pool is a floor, not a ceiling (ADR-034): `accounts` is what exists
+  // The pool is a floor, not a ceiling (ADR-034): `account_count` is what exists
   // today and every one of these rows can grow from the dashboard.
   return c.json(ok(result.results ?? []));
 });

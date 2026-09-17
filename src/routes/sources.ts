@@ -1,10 +1,18 @@
 /**
  * Sources — directories, Class C manual rows, Class X blocks, import ledger.
  *
- * `block_reason` and `class` are returned on every directory row so the UI never
- * has to infer a gate from a missing field. Class X is returned like any other
- * row rather than filtered out: the console shows it, and its `enabled` flag is
- * what makes it unusable — hiding it would make the registry lie by omission.
+ * Field names here are the CONTRACT's, not the database's, and the translation
+ * happens in SQL aliases. The console's types are the contract
+ * (13-ui-contract.md), so `rate_limit_per_min` leaves as `rate_limit_rpm`,
+ * `last_success_at` as `last_ok_at`, and the pagination blob is unpacked into the
+ * three flat fields the table renders. Returning database column names instead
+ * produced `undefined` cells and, where a page mapped over the result, a blank
+ * screen — the two most visible faults in the console.
+ *
+ * `block_reason` and `class` travel on every row so the UI never has to infer a
+ * gate from a missing field, and Class X is returned like any other row rather
+ * than filtered out: its `enabled` flag is what makes it unusable, and hiding it
+ * would make the registry lie by omission.
  */
 
 import { Hono } from 'hono';
@@ -14,63 +22,110 @@ import type { Actor, Env } from '../env';
 
 export const sourceRoutes = new Hono<{ Bindings: Env; Variables: { actor: Actor } }>();
 
-const DIRECTORY_COLUMNS = `
-  id, source_key, display_name, base_url, target_type, adapter, rate_limit_per_min,
-  requires_credential, robots_ok, class, block_reason, why_manual, manual_url_template,
-  attribution_html, health, consecutive_failures, last_success_at, last_heal_at, enabled, note`;
+/**
+ * Shared projection. `active_pack_version` is a correlated subquery rather than a
+ * join so a source with two active packs (which should never happen) still yields
+ * one row here instead of multiplying.
+ */
+const DIRECTORY_SELECT = `
+  SELECT d.source_key, d.display_name, d.base_url, d.target_type, d.adapter,
+         COALESCE(d.rate_limit_per_min, 0) AS rate_limit_rpm,
+         d.url_template,
+         json_extract(d.pagination_json, '$.mode')      AS pagination_mode,
+         json_extract(d.pagination_json, '$.param')     AS pagination_param,
+         json_extract(d.pagination_json, '$.max_pages') AS max_pages,
+         d.enabled, d.health, d.consecutive_failures,
+         d.last_success_at AS last_ok_at,
+         d.class, d.block_reason, d.why_manual, d.manual_url_template,
+         d.attribution_html, d.robots_ok, d.requires_credential, d.note,
+         (SELECT MAX(p.version) FROM selector_packs p
+           WHERE p.source_key = d.source_key AND p.status = 'active') AS active_pack_version
+    FROM directory_sources d`;
 
 sourceRoutes.get('/sources/directories', async (c) => {
   const url = new URL(c.req.url);
   const sourceClass = url.searchParams.get('class');
 
   const result = sourceClass
-    ? await c.env.DB.prepare(
-        `SELECT ${DIRECTORY_COLUMNS} FROM directory_sources
-          WHERE class = ? AND deleted_at IS NULL ORDER BY source_key ASC`,
-      )
+    ? await c.env.DB.prepare(`${DIRECTORY_SELECT} WHERE d.class = ? AND d.deleted_at IS NULL ORDER BY d.class ASC, d.source_key ASC`)
         .bind(sourceClass)
         .all()
-    : await c.env.DB.prepare(
-        `SELECT ${DIRECTORY_COLUMNS} FROM directory_sources
-          WHERE deleted_at IS NULL ORDER BY class ASC, source_key ASC`,
-      ).all();
+    : await c.env.DB.prepare(`${DIRECTORY_SELECT} WHERE d.deleted_at IS NULL ORDER BY d.class ASC, d.source_key ASC`).all();
 
   return c.json(ok(result.results ?? []));
 });
 
 sourceRoutes.get('/sources/manual', async (c) => {
   const result = await c.env.DB.prepare(
-    `SELECT ${DIRECTORY_COLUMNS} FROM directory_sources
-      WHERE class = 'C' AND deleted_at IS NULL ORDER BY source_key ASC`,
+    `SELECT d.source_key, d.display_name, d.block_reason, d.why_manual,
+            d.manual_url_template, d.attribution_html,
+            -- The override lives on the capture batch, not on the source: a
+            -- permission is granted per capture session, never once and for all.
+            COALESCE((SELECT b.override_ack FROM capture_batches b
+                       WHERE b.source_key = d.source_key
+                       ORDER BY b.created_at DESC LIMIT 1), 0) AS override_ack,
+            (SELECT b.override_reason FROM capture_batches b
+              WHERE b.source_key = d.source_key
+              ORDER BY b.created_at DESC LIMIT 1) AS override_reason
+       FROM directory_sources d
+      WHERE d.class = 'C' AND d.deleted_at IS NULL
+      ORDER BY d.source_key ASC`,
   ).all();
   return c.json(ok(result.results ?? []));
 });
 
 sourceRoutes.get('/sources/blocked', async (c) => {
   const result = await c.env.DB.prepare(
-    `SELECT ${DIRECTORY_COLUMNS} FROM directory_sources
-      WHERE block_reason <> 'none' AND deleted_at IS NULL ORDER BY class ASC, source_key ASC`,
+    `SELECT d.source_key, d.display_name, d.block_reason,
+            -- The console labels this column "explanation"; the registry stores
+            -- the same idea as why_manual.
+            COALESCE(d.why_manual, d.note, '') AS explanation,
+            d.class
+       FROM directory_sources d
+      WHERE d.block_reason <> 'none' AND d.deleted_at IS NULL
+      ORDER BY d.class ASC, d.source_key ASC`,
   ).all();
-  return c.json(
-    ok({
-      rows: result.results ?? [],
-      // Class X cannot be opened by an override; Class C can, by a human, with a
-      // written reason. The UI needs that difference and should not compute it.
-      note: "Class X is blocked permanently (ADR-031); Class C overrides are recorded in capture_batches with a reason of at least 20 characters.",
-    }),
-  );
+
+  // An array, because the console declares `BlockedSource[]`. Wrapping it in an
+  // object was a mistake of mine and it crashed the tab that maps over it — the
+  // rule is simple: the declared type wins, every time.
+  return c.json(ok(result.results ?? []));
 });
 
 sourceRoutes.get('/sources/imports', async (c) => {
   const url = new URL(c.req.url);
   const limit = Math.min(intParam(url, 'limit') ?? 50, 200);
   const result = await c.env.DB.prepare(
-    `SELECT id, dataset, release_version, geo_target_id, rows_read, rows_kept, rows_inserted,
-            rows_deduped, min_confidence, runner, duration_sec, status, error_text, started_at, finished_at
+    `SELECT id, dataset, release_version,
+            rows_read      AS rows_scanned,
+            rows_inserted  AS rows_ingested,
+            rows_deduped   AS rows_merged,
+            COALESCE(rows_read, 0) - COALESCE(rows_kept, 0) AS rows_skipped,
+            min_confidence, duration_sec, status, started_at
        FROM dataset_imports ORDER BY started_at DESC LIMIT ?`,
   )
     .bind(limit)
     .all();
+  return c.json(ok(result.results ?? []));
+});
+
+sourceRoutes.get('/sources/selector-packs', async (c) => {
+  const url = new URL(c.req.url);
+  const sourceKey = url.searchParams.get('source_key');
+
+  const sql = `
+    SELECT id, source_key, version, status, field_count, success_rate, runs, empty_runs,
+           generated_by, heal_reason, sample_ref, approved_by, approved_at, created_at,
+           -- A short preview so the approve step is not a blind click.
+           substr(COALESCE(selector_json, ''), 1, 160) AS selector_preview
+      FROM selector_packs
+     ${sourceKey ? 'WHERE source_key = ?' : ''}
+     ORDER BY source_key ASC, version DESC`;
+
+  const result = sourceKey
+    ? await c.env.DB.prepare(sql).bind(sourceKey).all()
+    : await c.env.DB.prepare(sql).all();
+
   return c.json(ok(result.results ?? []));
 });
 

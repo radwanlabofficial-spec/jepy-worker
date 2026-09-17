@@ -46,6 +46,10 @@ meRoutes.get('/me', (c) => {
       role: actor.kind === 'admin' ? 'admin' : 'operator',
       auth_kind: actor.kind,
       session_valid: true,
+      // The topbar's badge. `demo` is always false here: this is the API, and an
+      // answer from it is by definition live data.
+      env: c.env.ENVIRONMENT === 'production' ? 'prod' : 'dev',
+      demo: false,
     }),
   );
 });

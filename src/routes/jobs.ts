@@ -14,17 +14,18 @@ import type { Actor, Env } from '../env';
 export const jobRoutes = new Hono<{ Bindings: Env; Variables: { actor: Actor } }>();
 
 jobRoutes.get('/jobs/meta', async (c) => {
-  const [depth, oldest, byType] = await c.env.DB.batch<Record<string, unknown>>([
+  const [live, dead, circuits, byType] = await c.env.DB.batch<Record<string, unknown>>([
     c.env.DB.prepare(
       `SELECT COUNT(*) AS queue_depth,
-              SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) AS running,
-              SUM(CASE WHEN status = 'needs_manual' THEN 1 ELSE 0 END) AS needs_manual,
-              SUM(CASE WHEN status = 'dead' THEN 1 ELSE 0 END) AS dead
+              COALESCE(SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), 0) AS running,
+              COALESCE(SUM(CASE WHEN status = 'needs_manual' THEN 1 ELSE 0 END), 0) AS needs_manual,
+              MIN(CASE WHEN status = 'pending' THEN created_at END) AS oldest_pending
          FROM job_queue WHERE status IN ('pending','claimed','running','needs_manual')`,
     ),
-    c.env.DB.prepare(
-      `SELECT MIN(created_at) AS oldest_pending FROM job_queue WHERE status = 'pending'`,
-    ),
+    // Counted separately: the previous version asked for `dead` inside a query
+    // that filtered `dead` out, so the number was structurally always zero.
+    c.env.DB.prepare(`SELECT COUNT(*) AS dead_count FROM job_queue WHERE status IN ('dead','failed')`),
+    c.env.DB.prepare(`SELECT COUNT(*) AS open_circuits FROM circuit_state WHERE state = 'open'`),
     c.env.DB.prepare(
       `SELECT job_type, COUNT(*) AS n FROM job_queue
         WHERE status IN ('pending','claimed','running') GROUP BY job_type`,
@@ -32,14 +33,18 @@ jobRoutes.get('/jobs/meta', async (c) => {
   ]);
   // DB.batch answers one result per statement, in order. Checking it here turns
   // a silent undefined into a loud failure, and lets the unions narrow.
-  if (!depth || !oldest || !byType) throw new Error('batch result count mismatch');
+  if (!live || !dead || !circuits || !byType) throw new Error('batch result count mismatch');
 
-  const sum = (depth.results ?? [])[0] ?? {};
-  const oldestPending = (oldest.results ?? [])[0]?.oldest_pending as number | null;
+  const liveRow = (live.results ?? [])[0] ?? {};
+  const oldestPending = liveRow.oldest_pending as number | null;
 
   return c.json(
     ok({
-      ...sum,
+      queue_depth: Number(liveRow.queue_depth ?? 0),
+      running: Number(liveRow.running ?? 0),
+      needs_manual: Number(liveRow.needs_manual ?? 0),
+      dead_count: Number((dead.results ?? [])[0]?.dead_count ?? 0),
+      open_circuits: Number((circuits.results ?? [])[0]?.open_circuits ?? 0),
       // Seconds, not a timestamp: the UI decides how to phrase "19m ago".
       oldest_pending_sec: oldestPending ? Math.floor(Date.now() / 1000) - oldestPending : null,
       by_type: byType.results ?? [],

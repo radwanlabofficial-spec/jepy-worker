@@ -28,7 +28,10 @@ export const vaultRoutes = new Hono<{ Bindings: Env; Variables: { actor: Actor }
 vaultRoutes.get('/vault/credentials', async (c) => {
   const result = await c.env.DB.prepare(
     `SELECT c.id, a.provider, a.account_label, c.key_name, c.last4, c.test_status,
-            c.last_tested_at, c.rotated_at, a.quota_expires_at
+            c.last_tested_at, c.rotated_at, a.quota_expires_at,
+            -- The console uses this to decide whether the account still needs a
+            -- key, so an account without one must be able to say so.
+            1 AS has_credential
        FROM provider_credentials c
        JOIN provider_accounts a ON a.id = c.account_id
       ORDER BY a.provider ASC, a.account_label ASC, c.key_name ASC`,

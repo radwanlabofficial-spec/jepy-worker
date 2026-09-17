@@ -18,17 +18,18 @@ miscRoutes.get('/audit', async (c) => {
   const limit = Math.min(intParam(url, 'limit') ?? 100, 500);
   const entityType = url.searchParams.get('entity_type');
 
+  // Aliased to the contract's names: `at` and `detail`. Returning created_at and
+  // detail_json left the WHEN and DETAIL columns of the audit table empty.
+  const columns = `id, entity_type, entity_id, action, actor_email, result,
+                   detail_json AS detail, created_at AS at`;
+
   const result = entityType
     ? await c.env.DB.prepare(
-        `SELECT id, entity_type, entity_id, action, actor_email, result, detail_json, created_at
-           FROM audit_log WHERE entity_type = ? ORDER BY created_at DESC LIMIT ?`,
+        `SELECT ${columns} FROM audit_log WHERE entity_type = ? ORDER BY created_at DESC LIMIT ?`,
       )
         .bind(entityType, limit)
         .all()
-    : await c.env.DB.prepare(
-        `SELECT id, entity_type, entity_id, action, actor_email, result, detail_json, created_at
-           FROM audit_log ORDER BY created_at DESC LIMIT ?`,
-      )
+    : await c.env.DB.prepare(`SELECT ${columns} FROM audit_log ORDER BY created_at DESC LIMIT ?`)
         .bind(limit)
         .all();
 
