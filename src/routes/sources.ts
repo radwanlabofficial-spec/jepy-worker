@@ -129,6 +129,21 @@ sourceRoutes.get('/sources/selector-packs', async (c) => {
   return c.json(ok(result.results ?? []));
 });
 
+// The per-source form the console uses once a source is chosen. Registered as
+// its own route because Hono treats an empty parameter and a missing segment as
+// different paths, and the console is allowed to ask either way.
+sourceRoutes.get('/sources/directories/:sourceKey/selector-packs', async (c) => {
+  const result = await c.env.DB.prepare(
+    `SELECT id, source_key, version, status, field_count, success_rate, runs, empty_runs,
+            generated_by, heal_reason, sample_ref, approved_by, approved_at, created_at,
+            substr(COALESCE(selector_json, ''), 1, 160) AS selector_preview
+       FROM selector_packs WHERE source_key = ? ORDER BY version DESC`,
+  )
+    .bind(c.req.param('sourceKey'))
+    .all();
+  return c.json(ok(result.results ?? []));
+});
+
 sourceRoutes.get('/sources/health', async (c) => {
   const url = new URL(c.req.url);
   const since = intParam(url, 'since') ?? Math.floor(Date.now() / 1000) - 14 * 86_400;
