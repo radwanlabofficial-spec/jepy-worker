@@ -1,5 +1,7 @@
 # `0001_init.sql` — apply করার আগে যা সিদ্ধান্ত দরকার
 
+> ⛔ **এখন ঐতিহাসিক নথি — ২০২৬-০৯-১৮-এ `--remote apply` হয়ে গেছে।** উপরের সব সিদ্ধান্ত নেওয়া ও বসানো হয়েছে (`stage`/`next_follow_up_at`/`lost_reason`/`language`/`timezone`, `stage_events` ও `clients`, `route_attempts`-এর ৮টি কলাম, `job_queue.needs_manual` + `quota_sync`, `provider_accounts`-এর plan কলাম, `d1_daily_write_ceiling = 1500000`)। ফাইলটা এখন **immutable** (ADR-028) — এরপর যেকোনো পরিবর্তন নতুন migration + নতুন ADR দিয়ে। এই নথি রাখা হলো যাতে ভবিষ্যতে "কেন ওই কলামগুলো আছে" প্রশ্নের উত্তর থাকে।
+
 > **অবস্থা:** ফাইল লেখা ও যাচাই করা হয়েছে — ৪২ টেবিল, ৬৪ index, ৯টি settings seed, কোনো FK ভাঙা নেই, ছয়টি CHECK নিয়ম আসলেই কাজ করে (SQLite 3.45.1-এ চালিয়ে দেখা)।
 > **জরুরি:** একবার `wrangler d1 migrations apply --remote` চালালে এই ফাইল **চিরতরে immutable** (ADR-028)। তারপর প্রতিটি ছোট যোগের জন্যও নতুন ADR + নতুন migration লাগবে। তাই নিচের সিদ্ধান্তগুলো **এখনই** দরকার।
 

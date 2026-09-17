@@ -14,7 +14,7 @@
 
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
-import { fail } from './lib/envelope';
+import { fail, ok } from './lib/envelope';
 import { requireActor } from './middleware/auth';
 import type { Actor, Env } from './env';
 
@@ -58,6 +58,22 @@ app.use('/api/*', async (c, next) => {
   }
   return requireActor(c, next);
 });
+
+// A human who opens the bare hostname gets an answer instead of a 404. This is
+// not a data route and carries no configuration: it exists because "the link
+// does not work" is the wrong first impression for a service that is in fact
+// running, and the console is the only real entry point.
+app.get('/', (c) =>
+  c.json(
+    ok({
+      service: 'jepy-worker',
+      status: 'running',
+      health: '/api/health',
+      console: c.env.CONSOLE_ORIGIN || null,
+      note: 'All data routes live under /api and require a Cloudflare Access session. This hostname is not the console.',
+    }),
+  ),
+);
 
 app.route('/api', healthRoutes);
 app.route('/api', meRoutes);
