@@ -10,11 +10,163 @@
  */
 
 import { Hono } from 'hono';
-import { ok } from '../lib/envelope';
+import { z } from 'zod';
+import { fail, ok } from '../lib/envelope';
 import { intParam } from '../lib/http';
 import type { Actor, Env } from '../env';
 
 export const providerRoutes = new Hono<{ Bindings: Env; Variables: { actor: Actor } }>();
+
+// `/next-label` is registered before `/accounts/:id` would matter, but they use
+// different methods so there is no shadowing here.
+providerRoutes.get('/providers/accounts/next-label', async (c) => {
+  const url = new URL(c.req.url);
+  const provider = (url.searchParams.get('provider') ?? '').trim();
+  if (!provider) {
+    const { body, status } = fail('E_VALIDATION');
+    return c.json(body, status as 400);
+  }
+
+  const row = await c.env.DB.prepare(
+    `SELECT COUNT(*) AS used FROM provider_accounts WHERE provider = ?`,
+  )
+    .bind(provider)
+    .first<{ used: number }>();
+
+  const used = row?.used ?? 0;
+  return c.json(
+    ok({
+      account_label: `${provider}-${String(used + 1).padStart(2, '0')}`,
+      // The unit a provider counts in. Kept here so the UI does not hard-code it.
+      unit_type: provider === 'apify' ? 'USD' : provider === 'zerobounce' ? 'verifications' : null,
+    }),
+  );
+});
+
+const accountSchema = z.object({
+  provider: z.string().min(1),
+  account_label: z.string().min(1),
+  quota_limit: z.number().int().nonnegative().nullable().optional(),
+  quota_window: z.enum(['day', 'month']).nullable().optional(),
+  daily_limit: z.number().int().nonnegative().nullable().optional(),
+  // Only for providers whose free allowance has an end date (mapquest, R14).
+  quota_expires_at: z.number().int().positive().nullable().optional(),
+  plan_label: z.string().max(40).nullable().optional(),
+  plan_price_micro: z.number().int().nonnegative().nullable().optional(),
+});
+
+providerRoutes.post('/providers/accounts', async (c) => {
+  const parsed = accountSchema.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) {
+    const { body, status } = fail('E_VALIDATION');
+    return c.json(body, status as 400);
+  }
+  const input = parsed.data;
+
+  const existing = await c.env.DB.prepare(
+    `SELECT id FROM provider_accounts WHERE provider = ? AND account_label = ?`,
+  )
+    .bind(input.provider, input.account_label)
+    .first<{ id: string }>();
+
+  if (existing) {
+    const { body, status } = fail('E_CONFLICT', { reason: 'label_reused', account_label: input.account_label });
+    return c.json(body, status as 409);
+  }
+
+  const id = crypto.randomUUID();
+  await c.env.DB.prepare(
+    `INSERT INTO provider_accounts
+       (id, provider, account_label, quota_limit, quota_window, daily_limit, quota_expires_at,
+        plan_label, plan_price_micro, status, enabled, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1, unixepoch())`,
+  )
+    .bind(
+      id,
+      input.provider,
+      input.account_label,
+      input.quota_limit ?? null,
+      input.quota_window ?? null,
+      input.daily_limit ?? null,
+      input.quota_expires_at ?? null,
+      input.plan_label ?? null,
+      input.plan_price_micro ?? null,
+    )
+    .run();
+
+  // `audit_log.entity_type` is a closed enum of four values and an account is not
+  // one of them, so account changes are recorded against their credentials — the
+  // surface they exist to hold — with the account named in the detail.
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO audit_log (id, entity_type, entity_id, action, actor_email, result, detail_json, created_at)
+       VALUES (?, 'credential', ?, 'add', ?, 'ok', ?, unixepoch())`,
+    )
+      .bind(crypto.randomUUID(), id, c.get('actor').email, JSON.stringify({ kind: 'provider_account', ...input }))
+      .run();
+  } catch {
+    // ignore
+  }
+
+  return c.json(ok({ id, account_label: input.account_label, provider: input.provider }));
+});
+
+const accountPatchSchema = z.object({
+  enabled: z.boolean().optional(),
+  priority: z.number().int().min(1).max(10).optional(),
+  plan_label: z.string().max(40).nullable().optional(),
+  plan_price_micro: z.number().int().nonnegative().nullable().optional(),
+  // Quota is intentionally absent: it is owned by the provider and the rollover
+  // job, and a writable quota would let the UI disagree with reality.
+});
+
+providerRoutes.patch('/providers/accounts/:id', async (c) => {
+  const parsed = accountPatchSchema.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) {
+    const { body, status } = fail('E_VALIDATION');
+    return c.json(body, status as 400);
+  }
+  const patch = parsed.data;
+  const id = c.req.param('id');
+
+  const row = await c.env.DB.prepare(`SELECT id, provider, account_label FROM provider_accounts WHERE id = ?`)
+    .bind(id)
+    .first<{ id: string; provider: string; account_label: string }>();
+  if (!row) {
+    const { body, status } = fail('E_NOT_FOUND');
+    return c.json(body, status as 404);
+  }
+
+  await c.env.DB.prepare(
+    `UPDATE provider_accounts
+        SET enabled = COALESCE(?, enabled),
+            priority = COALESCE(?, priority),
+            plan_label = COALESCE(?, plan_label),
+            plan_price_micro = COALESCE(?, plan_price_micro)
+      WHERE id = ?`,
+  )
+    .bind(
+      patch.enabled === undefined ? null : patch.enabled ? 1 : 0,
+      patch.priority ?? null,
+      patch.plan_label ?? null,
+      patch.plan_price_micro ?? null,
+      id,
+    )
+    .run();
+
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO audit_log (id, entity_type, entity_id, action, actor_email, result, detail_json, created_at)
+       VALUES (?, 'credential', ?, 'test', ?, 'ok', ?, unixepoch())`,
+    )
+      .bind(crypto.randomUUID(), id, c.get('actor').email, JSON.stringify({ kind: 'provider_account_patch', ...patch }))
+      .run();
+  } catch {
+    // ignore
+  }
+
+  return c.json(ok({ id, ...patch }));
+});
 
 providerRoutes.get('/providers/accounts', async (c) => {
   const result = await c.env.DB.prepare(
