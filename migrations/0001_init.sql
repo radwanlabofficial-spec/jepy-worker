@@ -575,7 +575,14 @@ CREATE TABLE score_weights (
   id          TEXT PRIMARY KEY,
   version     INTEGER NOT NULL,
   feature_key TEXT NOT NULL,
-  weight      REAL NOT NULL CHECK (weight >= 0.5 AND weight <= 1.5),
+  -- Points, not a multiplier: 12-scoring.md §2 allocates the v1 weights as
+  -- points summing to 100 per version (35 Website Pain + 25 Reachability
+  -- + 25 Buying Signal + 15 Fit). The 0.5-1.5 clamp in ADR-021 governs the
+  -- weekly feedback step — `new_weight = old × clamp(lift, 0.5, 1.5)`, recorded
+  -- in weight_history — and is NOT a bound on the absolute weight. Applying it
+  -- here would cap an 18-feature version at 27 points and make the documented
+  -- v1 set impossible to insert.
+  weight      REAL NOT NULL CHECK (weight >= 0 AND weight <= 100),
   is_active   INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0,1)),
   created_at  INTEGER NOT NULL DEFAULT (unixepoch())
 );
