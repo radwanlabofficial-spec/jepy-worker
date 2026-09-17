@@ -54,9 +54,14 @@ miscRoutes.get('/settings/geo-targets', async (c) => {
   // one more thing that can drift away from the leads it counts.
   const result = await c.env.DB.prepare(
     `SELECT g.id,
+            -- COALESCE takes at least two arguments; wrapping a bare CASE in one
+            -- is a syntax error that only shows up at execution time.
             COALESCE(
               CASE WHEN g.city IS NOT NULL AND g.region IS NOT NULL THEN g.city || ', ' || g.region
-                   ELSE COALESCE(g.city, g.region, g.country_code) END
+                   WHEN g.city IS NOT NULL THEN g.city
+                   WHEN g.region IS NOT NULL THEN g.region
+                   ELSE NULL END,
+              g.country_code
             ) AS label,
             g.country_code,
             (SELECT COUNT(DISTINCT l.niche) FROM leads l
