@@ -19,3 +19,14 @@ database_id = "0c391e50-e258-4c62-a7d2-a246269d8940"
 # KV, R2 and the Durable Object binding are added in Phase 4, once their
 # namespaces exist. They are deliberately absent rather than placeholdered:
 # a binding that points nowhere fails at request time, not at deploy time.
+
+[vars]
+ENVIRONMENT = "production"
+# Cloudflare Access: the Zero Trust team domain and this application's aud.
+# Both are non-secret by nature — they travel in every login URL — and the
+# Worker needs them to verify the assertion header.
+ACCESS_TEAM_DOMAIN = "hidden-mouse-a469.cloudflareaccess.com"
+ACCESS_AUD = "a24977c8380f68525efe2696528c94e8114f4b7a71a6936f7e172331c263616a"
+# Only consulted if a browser calls the API cross-origin; the console normally
+# goes through the same-origin Pages proxy and never needs this.
+CONSOLE_ORIGIN = "https://jepy-dashboard.pages.dev"

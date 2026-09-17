@@ -7,3 +7,5 @@ dist
 *.sqlite
 *.sqlite3
 *.log
+secrets.local.*
+*.local.backup
