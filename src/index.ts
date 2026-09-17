@@ -28,6 +28,9 @@ import { scoringRoutes } from './routes/scoring';
 import { vaultRoutes } from './routes/vault';
 import { emailRoutes } from './routes/email';
 import { miscRoutes } from './routes/misc';
+import { CRONS, TRIGGERS, runScheduled, runTick } from './jobs/scheduled';
+import { cancel, enqueue, retry } from './lib/queue';
+import { z } from 'zod';
 
 type AppEnv = { Bindings: Env; Variables: { actor: Actor } };
 
@@ -112,4 +115,97 @@ app.onError(async (error, c) => {
   return c.json(body, status as 500);
 });
 
-export default app;
+/**
+ * Queue control. The console enqueues work and can retry or cancel it; nothing
+ * here calls a provider, so a human click cannot spend money on its own — the
+ * dispatcher does that, on its own schedule, inside its own budget.
+ */
+const enqueueSchema = z.object({
+  job_type: z.enum(['dataset_import', 'probe', 'scrape', 'enrich', 'verify', 'score', 'dom', 'email', 'quota_sync']),
+  target_type: z.string().min(1).nullable().optional(),
+  payload: z.unknown().optional(),
+  priority: z.number().int().min(1).max(10).optional(),
+});
+
+app.post('/api/jobs', async (c) => {
+  const parsed = enqueueSchema.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) {
+    const { body, status } = fail('E_VALIDATION');
+    return c.json(body, status as 400);
+  }
+  const id = await enqueue(c.env.DB, {
+    jobType: parsed.data.job_type,
+    targetType: parsed.data.target_type ?? null,
+    payload: parsed.data.payload,
+    priority: parsed.data.priority,
+  });
+  return c.json(ok({ id, status: 'pending' }));
+});
+
+app.post('/api/jobs/:id/retry', async (c) => {
+  const changed = await retry(c.env.DB, c.req.param('id'));
+  if (!changed) {
+    // Nothing to retry: either it does not exist or it is still live. Both are
+    // the same answer to a human, and neither is an error.
+    const { body, status } = fail('E_NOT_FOUND', { reason: 'not_retryable' });
+    return c.json(body, status as 404);
+  }
+  return c.json(ok({ id: c.req.param('id'), status: 'pending' }));
+});
+
+app.post('/api/jobs/:id/cancel', async (c) => {
+  const changed = await cancel(c.env.DB, c.req.param('id'));
+  if (!changed) {
+    const { body, status } = fail('E_NOT_FOUND', { reason: 'not_cancellable' });
+    return c.json(body, status as 404);
+  }
+  return c.json(ok({ id: c.req.param('id'), status: 'dead' }));
+});
+
+/**
+ * Manual trigger for one scheduled job. Cloudflare offers no way to fire a cron
+ * on demand, and "wait until Monday 05:00 to see whether it works" is not a
+ * verification strategy. It is also what the console's backup button calls.
+ */
+app.post('/api/admin/run-cron', async (c) => {
+  const parsed = z.object({ cron: z.string().min(1) }).safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) {
+    const { body, status } = fail('E_VALIDATION');
+    return c.json(body, status as 400);
+  }
+  const known = Object.values(CRONS) as string[];
+  if (!known.includes(parsed.data.cron)) {
+    const { body, status } = fail('E_VALIDATION', { reason: 'unknown_cron', known });
+    return c.json(body, status as 400);
+  }
+
+  await runScheduled(parsed.data.cron, c.env);
+  const last = await c.env.DB.prepare(
+    `SELECT cron_name, status, error_text, jobs_dispatched, finished_at
+       FROM cron_runs ORDER BY started_at DESC LIMIT 1`,
+  ).first();
+  return c.json(ok({ cron: parsed.data.cron, last }));
+});
+
+app.get('/api/admin/cron-runs', async (c) => {
+  const rows = await c.env.DB.prepare(
+    `SELECT cron_name, started_at, finished_at, jobs_dispatched, sub_requests_used, status, error_text
+       FROM cron_runs ORDER BY started_at DESC LIMIT 50`,
+  ).all();
+  return c.json(ok(rows.results ?? []));
+});
+
+export default {
+  fetch: app.fetch,
+  /**
+   * The scheduler. Each trigger carries its own cron string, and the run is
+   * recorded whether it succeeds or throws.
+   */
+  async scheduled(event: { cron: string }, env: Env, ctx: { waitUntil(promise: Promise<unknown>): void }): Promise<void> {
+    // Two triggers, nine jobs. The fast one runs the dispatcher; the hourly one
+    // asks runTick which of the other eight are due right now.
+    ctx.waitUntil(
+      event.cron === TRIGGERS.dispatcher ? runScheduled(CRONS.dispatcher, env) : runTick(env),
+    );
+  },
+};

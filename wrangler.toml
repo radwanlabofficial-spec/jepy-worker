@@ -20,6 +20,22 @@ database_id = "0c391e50-e258-4c62-a7d2-a246269d8940"
 # namespaces exist. They are deliberately absent rather than placeholdered:
 # a binding that points nowhere fails at request time, not at deploy time.
 
+# TWO triggers carry NINE jobs (11-api-contract.md §11 lists the jobs, not the
+# triggers). Cloudflare caps the number of cron triggers per Worker, so one
+# fast trigger runs the dispatcher and one hourly trigger decides which of the
+# remaining eight are due — by reading the UTC hour and weekday itself.
+# The handler in src/jobs/scheduled.ts holds that mapping.
+#
+# Consequence worth knowing: the jobs documented at 00:05, 03:00, 04:00 run on
+# the hour instead, and a failed hourly tick delays them by up to an hour. Both
+# are visible in cron_runs, and any job can be run on demand with
+# POST /api/admin/run-cron when waiting is not acceptable.
+[triggers]
+crons = [
+  "*/2 * * * *",  # dispatcher — claims due jobs every two minutes
+  "0 * * * *",    # hourly tick — budget guard always, plus whatever is due
+]
+
 [vars]
 ENVIRONMENT = "production"
 # Cloudflare Access: the Zero Trust team domain and this application's aud.
