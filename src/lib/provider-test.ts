@@ -98,10 +98,42 @@ export async function testCredential(provider: string, secret: string): Promise<
         };
       }
 
+      case 'brightdata': {
+        // 06 §12 names the check but not the URL. This one was confirmed against
+        // the live API with a real key rather than guessed: `/status` answers 200
+        // with `status: active`, the customer id, and — the useful part —
+        // `can_make_requests` plus `auth_fail_reason`.
+        //
+        // That distinction matters. A key can be perfectly valid while the account
+        // has no zone yet, and those two facts need different reactions: one means
+        // "replace this credential", the other means "finish setting the account
+        // up". A bare 200 would report both as healthy.
+        const response = await probe('https://api.brightdata.com/status', {
+          headers: { Authorization: `Bearer ${secret}`, 'User-Agent': 'jepy-worker/1.0' },
+        });
+        if (!response.ok) return classify(response, '');
+
+        const body = (await response.json()) as {
+          status?: string;
+          customer?: string;
+          can_make_requests?: boolean;
+          auth_fail_reason?: string;
+        };
+        if (!body.customer) {
+          return { status: 'failed', message: 'provider answered HTTP 200 but returned no customer — key not accepted' };
+        }
+        if (body.can_make_requests === false) {
+          return {
+            status: 'ok',
+            message: `key accepted (${body.customer}) but the account cannot make requests yet: ${body.auth_fail_reason ?? 'unknown reason'} — a zone has to be created in the BrightData dashboard`,
+          };
+        }
+        return { status: 'ok', message: `key accepted — ${body.customer}, requests enabled` };
+      }
+
       // 06 §12 names the check for these providers but no endpoint, and a guessed
       // URL would be indistinguishable from a working one until it silently
       // passed. They stay untested until the URL is confirmed.
-      case 'brightdata':
       case 'resend':
       case 'yelp':
       case 'mapquest':
@@ -121,4 +153,4 @@ export async function testCredential(provider: string, secret: string): Promise<
 }
 
 /** Providers this build can genuinely verify, for the UI to be honest about. */
-export const TESTABLE_PROVIDERS = ['apify', 'zerobounce', 'google_psi'] as const;
+export const TESTABLE_PROVIDERS = ['apify', 'zerobounce', 'google_psi', 'brightdata'] as const;
