@@ -179,12 +179,21 @@ app.post('/api/admin/run-cron', async (c) => {
     return c.json(body, status as 400);
   }
 
-  await runScheduled(parsed.data.cron, c.env);
+  // The name the run was recorded under comes back from the scheduler itself,
+  // so the endpoint never has to guess it from the expression.
+  const cronName = await runScheduled(parsed.data.cron, c.env);
+
   const last = await c.env.DB.prepare(
     `SELECT cron_name, status, error_text, jobs_dispatched, finished_at
-       FROM cron_runs ORDER BY started_at DESC LIMIT 1`,
-  ).first();
-  return c.json(ok({ cron: parsed.data.cron, last }));
+       FROM cron_runs
+      WHERE cron_name = ? AND started_at >= ?
+      ORDER BY started_at DESC, finished_at DESC
+      LIMIT 1`,
+  )
+    .bind(cronName, Math.floor(Date.now() / 1000) - 300)
+    .first();
+
+  return c.json(ok({ cron: parsed.data.cron, cron_name: cronName, last }));
 });
 
 app.get('/api/admin/cron-runs', async (c) => {
@@ -194,6 +203,14 @@ app.get('/api/admin/cron-runs', async (c) => {
   ).all();
   return c.json(ok(rows.results ?? []));
 });
+
+/**
+ * The router. Exported at module scope because Cloudflare resolves a Durable
+ * Object class by name from the Worker's entry module — `class_name = "RouterDO"`
+ * in wrangler.toml points here, and a class that is not exported from the entry
+ * is a deploy-time error that reads like a missing binding.
+ */
+export { RouterDO } from './do/RouterDO';
 
 export default {
   fetch: app.fetch,

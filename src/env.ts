@@ -10,6 +10,15 @@ export interface Env {
   /** D1: the single source of truth for leads, jobs, quota and the Vault. */
   DB: D1Database;
 
+  /**
+   * RouterDO, one instance per `target_type` (09 §3).
+   *
+   * The binding is declared rather than optional: a missing binding would make
+   * the dispatcher silently fall back to "no router", and a job queue that looks
+   * healthy while routing nothing is the failure this project can least afford.
+   */
+  ROUTER_DO: DurableObjectNamespace;
+
   /** Cloudflare Access: the Zero Trust team domain, e.g. `hidden-mouse-a469.cloudflareaccess.com`. */
   ACCESS_TEAM_DOMAIN: string;
   /** Cloudflare Access: this application's `aud`, checked on every human request. */

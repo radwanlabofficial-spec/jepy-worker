@@ -16,8 +16,25 @@ binding = "DB"
 database_name = "jepy-leads"
 database_id = "0c391e50-e258-4c62-a7d2-a246269d8940"
 
-# KV, R2 and the Durable Object binding are added in Phase 4, once their
-# namespaces exist. They are deliberately absent rather than placeholdered:
+# The RouterDO binding. One instance per target_type, addressed by that key from
+# the dispatcher — src/do/RouterDO.ts explains why it is a Durable Object at all.
+[[durable_objects.bindings]]
+name = "ROUTER_DO"
+class_name = "RouterDO"
+
+# `new_sqlite_classes`, not `new_classes`. A Durable Object created without SQLite
+# storage does not run on the Workers free tier, and that failure surfaces at
+# request time as "the Durable Object is not available" — which reads like a bug
+# in the router rather than a choice made in a config file (R17).
+#
+# The tag stays v1: this is the first migration this Worker has ever declared, and
+# renumbering it later would ask Cloudflare to re-apply it.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RouterDO"]
+
+# KV and R2 are still to come: the cache and the raw-body store arrive with the
+# adapters' storage step. They are deliberately absent rather than placeholdered —
 # a binding that points nowhere fails at request time, not at deploy time.
 
 # TWO triggers carry NINE jobs (11-api-contract.md §11 lists the jobs, not the

@@ -147,30 +147,112 @@ async function record(
 }
 
 /**
- * Dispatcher. Claims due jobs and runs them.
+ * Dispatcher. Claims due jobs and hands each one to the router.
  *
- * No adapter is registered until Phase 6, so a claimed job is parked in
- * `needs_manual` with the reason written on it rather than silently retried or
- * dropped. A job that disappears without a trace is the one failure mode a queue
- * must never have.
+ * It does not choose a provider, does not open the Vault and does not know what
+ * an adapter is. Its whole job is: claim atomically, address the right RouterDO by
+ * `target_type`, hand over the job, and record what came back. Everything the
+ * router decides is decided one layer down, which is why a dispatcher bug can
+ * cost a hop but cannot spend money on the wrong account.
+ *
+ * The DO address is the `target_type`, so two jobs for the same target type
+ * serialise against each other while different target types run in parallel
+ * (09 §3). A job with no `target_type` has nothing to route and is parked.
+ *
+ * THE TICK IS CAPPED AT FIVE. The sub-request budget is per Worker invocation
+ * (R15), and it is shared by every job this tick touches — claiming more work
+ * than the invocation can fund would mean the last jobs in the batch silently
+ * cross the ceiling.
  */
 async function dispatcher(env: Env): Promise<{ dispatched: number; note?: string }> {
   const paused = await setting(env.DB, 'dispatcher_paused');
   if (paused === 1) return { dispatched: 0, note: 'dispatcher_paused=1 — nothing claimed' };
 
-  // Cap per tick: a 40-sub-request budget is per invocation, so the tick must
-  // never claim more work than it can finish inside it.
   const claimed = await claim(env.DB, 'cron:dispatcher', 5);
   if (claimed.length === 0) return { dispatched: 0, note: 'queue empty' };
 
-  let dispatched = 0;
+  let done = 0;
+  let requeued = 0;
+  let manual = 0;
+  const notes: string[] = [];
+
   for (const job of claimed) {
     await markRunning(env.DB, job.id);
-    const reason = `no adapter registered for job_type=${job.job_type} target_type=${job.target_type ?? '-'} (Phase 6)`;
-    await fail(env.DB, job, reason, 'permanent');
-    dispatched += 1;
+
+    if (!job.target_type) {
+      // Nothing to route: a job with no target type is a producer's bug, and it
+      // is parked with the reason rather than retried into the same wall.
+      await fail(env.DB, job, `job_type=${job.job_type} has no target_type — nothing to route`, 'permanent');
+      manual += 1;
+      continue;
+    }
+
+    const payload = safeParse(job.payload_json);
+
+    // The runner is the JOB's context, not the dispatcher's assumption. Most
+    // work is `worker`, but a dataset import is enqueued for the GHA runner and
+    // an extension capture for the extension, and filter 10 compares the two.
+    // Hard-coding `worker` here would have made every gha-runner-only target
+    // (`overture_places`, `osm_overpass`, `fsq_places`) look like it had no
+    // candidates at all — a routing failure that would have been blamed on the
+    // seed. An unknown value falls back to `worker`, which is the runner that
+    // this tick actually is.
+    const declaredRunner = payload?.runner;
+    const runner =
+      declaredRunner === 'gha' || declaredRunner === 'extension' || declaredRunner === 'worker'
+        ? declaredRunner
+        : 'worker';
+
+    const stub = env.ROUTER_DO.get(env.ROUTER_DO.idFromName(job.target_type));
+    const response = await stub.fetch('https://router.internal/route', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        job_id: job.id,
+        target_type: job.target_type,
+        runner,
+        payload,
+        attempts: job.attempts,
+        max_attempts: job.max_attempts,
+      }),
+    });
+
+    if (!response.ok) {
+      // The router itself failed. That is transient by nature, so the job goes
+      // back on the queue with the normal backoff instead of being parked — a DO
+      // outage must not cost a job.
+      await fail(env.DB, job, `router returned HTTP ${response.status}`, 'transient');
+      requeued += 1;
+      continue;
+    }
+
+    const result = (await response.json()) as { status: string; hops: number; note: string };
+    if (result.status === 'done') done += 1;
+    else if (result.status === 'pending') requeued += 1;
+    else manual += 1;
+
+    // The router's own explanation is kept. "0 dispatched" with no reason is the
+    // shape of a bug report nobody can act on.
+    notes.push(`${job.target_type}:${result.status}:${result.hops}hop`);
   }
-  return { dispatched, note: `${claimed.length} claimed, ${dispatched} parked as needs_manual` };
+
+  return {
+    dispatched: done,
+    note: `${claimed.length} claimed — ${done} done, ${requeued} re-queued, ${manual} manual | ${notes.join(', ')}`,
+  };
+}
+
+/** A payload that will not parse is treated as empty rather than throwing: the
+ *  job's shape belongs to whatever enqueued it, and the router can still work
+ *  from `target_type` alone. */
+function safeParse(raw: string | null): Record<string, unknown> | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Budget guard: crossing the daily BrightData guard pauses the dispatcher. */
@@ -360,40 +442,54 @@ async function weeklyBackup(env: Env): Promise<{ dispatched: number; note?: stri
   return { dispatched: 1, note: `backup requested as job ${jobId.slice(0, 8)}` };
 }
 
-export async function runScheduled(cron: string, env: Env): Promise<void> {
+/**
+ * Runs one job and returns the NAME it was recorded under.
+ *
+ * The name is returned rather than derived by the caller. A cron expression and
+ * a job name are not the same string: the two-minute expression is recorded as
+ * `dispatcher`, not as itself. A caller that assumed otherwise would read back
+ * nothing at all. The on-demand endpoint managed both mistakes in one lifetime —
+ * first it returned the latest row of ANY job, then it looked for a row named
+ * after a cron expression. Returning the name here leaves exactly one mapping,
+ * and it is this switch.
+ */
+export async function runScheduled(cron: string, env: Env): Promise<string> {
   switch (cron) {
     case CRONS.dispatcher:
       await reclaimStale(env.DB);
       await record(env, 'dispatcher', () => dispatcher(env));
-      return;
+      return 'dispatcher';
     case CRONS.budgetGuard:
       await record(env, 'budget_guard', () => budgetGuard(env));
-      return;
+      return 'budget_guard';
     case CRONS.quotaRollover:
       await record(env, 'quota_rollover', () => quotaRollover(env));
-      return;
+      return 'quota_rollover';
     case CRONS.credentialTest:
       await record(env, 'credential_test', () => credentialTest(env));
-      return;
+      return 'credential_test';
     case CRONS.retentionPurge:
       await record(env, 'retention_purge', () => retentionPurge(env));
-      return;
+      return 'retention_purge';
     case CRONS.reconcile:
       await record(env, 'reconcile', () => reconcile(env));
-      return;
+      return 'reconcile';
     case CRONS.feedbackLoop:
       await record(env, 'feedback_loop', () => feedbackLoop(env));
-      return;
+      return 'feedback_loop';
     case CRONS.datasetImport:
       await record(env, 'dataset_import', () => datasetImport(env));
-      return;
+      return 'dataset_import';
     case CRONS.weeklyBackup:
       await record(env, 'weekly_backup', () => weeklyBackup(env));
-      return;
-    default:
+      return 'weekly_backup';
+    default: {
       // An unrecognised cron is recorded rather than ignored: a trigger that
       // fires into nothing is how a schedule silently stops being a schedule.
-      await record(env, `unknown:${cron}`, async () => ({ note: 'no handler for this cron expression' }));
+      const name = `unknown:${cron}`;
+      await record(env, name, async () => ({ note: 'no handler for this cron expression' }));
+      return name;
+    }
   }
 }
 
