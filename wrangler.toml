@@ -1,0 +1,21 @@
+name = "jepy-worker"
+main = "src/index.ts"
+# Pinned to a date the local workerd runtime already supports. The runtime's
+# compatibility-date list lags the calendar, so "today" is rejected as being in
+# the future; move this forward only when the runtime catches up.
+compatibility_date = "2026-08-01"
+workers_dev = true
+
+# D1 migrations live in ./migrations and are forward-only.
+#   local:  wrangler d1 migrations apply jepy-leads --local
+#   remote: wrangler d1 migrations apply jepy-leads --remote
+# Once --remote has run, migrations/0001_init.sql is never edited again
+# (ADR-028); every further change is a new numbered file plus an ADR.
+[[d1_databases]]
+binding = "DB"
+database_name = "jepy-leads"
+database_id = "0c391e50-e258-4c62-a7d2-a246269d8940"
+
+# KV, R2 and the Durable Object binding are added in Phase 4, once their
+# namespaces exist. They are deliberately absent rather than placeholdered:
+# a binding that points nowhere fails at request time, not at deploy time.
