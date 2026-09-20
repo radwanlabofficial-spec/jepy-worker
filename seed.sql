@@ -294,3 +294,80 @@ UPDATE settings SET value_num = 1 WHERE key = 'active_weights_version';
 --   * no provider_capability row has cost_micro_per_unit = 0 on a paid provider;
 --   * the active score_weights version sums to 100 (±0.01).
 -- ===========================================================================
+
+-- ===========================================================================
+-- E. geo_targets + niches — the market and the categories we sell into
+-- ===========================================================================
+-- These two tables are what Wave 0 filters on, and they were missing: the first
+-- seed left both empty. `niches.overture_categories_json` is the join between
+-- the import query and this table, so an empty niches table means an import that
+-- silently selects nothing.
+--
+-- PROVENANCE (R25 — no value without a source):
+--
+--   Every `overture_categories` value below was READ OUT of the dump, not guessed:
+--   release 2026-08-19.0, theme=places, filtered to a US bounding box with
+--   confidence >= 0.6 and grouped by `taxonomy.primary`. The counts quoted per
+--   niche are from a single part file of the sixteen, so they are a lower bound
+--   and a ratio, not a total.
+--
+--   `fsq_categories_json` stays NULL. Foursquare's own category names have not
+--   been read from its dataset yet, and a name invented here would be a filter
+--   that matches nothing on the one dataset it was written for.
+--
+--   `avg_deal_value_micro` stays NULL: it is a business input, not a fact about
+--   the data.
+--
+-- CHOICE OF MARKET. The niches are the buyer types for video editing, ordered by
+-- how obviously they buy it:
+--   real estate      listing tours, agent brand — the highest-volume buyer
+--   personal injury  the most video-advertised legal vertical in the US
+--   dental / med spa treatment explainers, before-and-after
+--   fitness          class and transformation content, subscription-driven
+--   auto dealer      inventory walkarounds
+--   agency           buys editing as white label, so one client is many videos
+--   restaurant       social cutdowns, menu and event content
+-- These are rows, not code: changing the target list is an UPDATE plus a
+-- re-import, and the next import picks it up because the runner reads the list
+-- from D1 (`GET /api/admin/import/niches`) rather than from the workflow file.
+
+INSERT OR REPLACE INTO niches
+  (id, niche_slug, display_name, overture_categories_json, fsq_categories_json,
+   avg_deal_value_micro, priority, enabled)
+VALUES
+  ('niche_real_estate', 'real_estate', 'Real estate agents and brokerages',
+   '["real_estate_agent","real_estate_service"]', NULL, NULL, 5, 1),
+  ('niche_law_injury', 'law_injury', 'Personal injury and law firms',
+   '["personal_injury_law","attorney_or_law_firm"]', NULL, NULL, 5, 1),
+  ('niche_dental', 'dental', 'Dental clinics and general dentistry',
+   '["dental_clinic","general_dentistry"]', NULL, NULL, 4, 1),
+  ('niche_med_spa', 'med_spa', 'Medical spas and spas',
+   '["medical_spa","spa"]', NULL, NULL, 4, 1),
+  ('niche_fitness', 'fitness', 'Gyms and fitness facilities',
+   '["gym","sport_or_fitness_facility"]', NULL, NULL, 4, 1),
+  ('niche_auto_dealer', 'auto_dealer', 'New and used car dealers',
+   '["auto_dealer","used_auto_dealer"]', NULL, NULL, 3, 1),
+  ('niche_agency', 'agency', 'Advertising and marketing agencies',
+   '["advertising_agency","marketing_agency"]', NULL, NULL, 3, 1),
+  ('niche_restaurant', 'restaurant', 'Independent restaurants',
+   '["restaurant","bar_and_grill_restaurant","pizza_restaurant","burger_restaurant","mexican_restaurant"]',
+   NULL, NULL, 2, 1);
+
+-- The national target is what "the USA market" means and what the weekly import
+-- will eventually scan. It carries a bbox rather than a city because the dump has
+-- no country partition: `places` is sixteen global files, so the only way to
+-- bound the read is a bounding box, and the continental US is the honest one.
+-- It excludes Alaska and Hawaii on purpose — they are separate scans with their
+-- own bboxes, not a rounding error.
+INSERT OR REPLACE INTO geo_targets
+  (id, country_code, region, city, bbox_json, population, priority, enabled, lead_count)
+VALUES
+  ('geo_us_national', 'US', NULL, NULL,
+   '{"xmin":-125.0,"ymin":24.0,"xmax":-66.0,"ymax":50.0}', NULL, 3, 1, 0),
+  -- The pilot target: one metro, small enough to prove the whole path end to
+  -- end — scan, stage in R2, upsert into D1, ledger counters — before a national
+  -- run spends an hour proving the same thing. Austin is a dense US metro with
+  -- all eight niches present, which is why it is first and why a first run
+  -- against it cannot pass with an accidental empty category list.
+  ('geo_us_tx_austin', 'US', 'TX', 'Austin',
+   '{"xmin":-98.05,"ymin":30.05,"xmax":-97.55,"ymax":30.55}', NULL, 1, 1, 0);

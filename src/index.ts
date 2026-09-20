@@ -28,6 +28,7 @@ import { scoringRoutes } from './routes/scoring';
 import { vaultRoutes } from './routes/vault';
 import { emailRoutes } from './routes/email';
 import { miscRoutes } from './routes/misc';
+import { importRoutes } from './routes/imports';
 import { CRONS, TRIGGERS, runScheduled, runTick } from './jobs/scheduled';
 import { cancel, enqueue, retry } from './lib/queue';
 import { z } from 'zod';
@@ -89,6 +90,7 @@ app.route('/api', scoringRoutes);
 app.route('/api', vaultRoutes);
 app.route('/api', emailRoutes);
 app.route('/api', miscRoutes);
+app.route('/api', importRoutes);
 
 app.notFound((c) => {
   const { body, status } = fail('E_NOT_FOUND');

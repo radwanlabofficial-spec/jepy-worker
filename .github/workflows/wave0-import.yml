@@ -1,0 +1,118 @@
+# Wave 0 — the Tier 0 bulk import (STEP 8).
+#
+# Why this runs here and not in the Worker: the Overture Places dump is ~10 GB of
+# parquet across sixteen files. A Worker cannot read it, a cron trigger's wall
+# clock would not allow it if it could, and the read is a batch job that wants a
+# full machine rather than an edge isolate.
+#
+# Why it pushes through the Worker instead of writing to R2 itself: DuckDB could
+# write parquet straight into the bucket over the S3 API, but that needs a second
+# long-lived credential — an R2 access key — with its own rotation and its own way
+# to end up in a log. The Worker already holds the `RAW` binding and already
+# authenticates this runner with `ADMIN_SECRET`, so the bytes go through it and no
+# new secret exists. See `src/routes/imports.ts`.
+#
+# Two modes on purpose. `probe` writes nothing and prints the schema plus the
+# category values that actually exist in the dump; `import` pushes rows. The
+# category strings are the join between this workflow and `niches`, and a guessed
+# string is a filter that silently matches nothing — so the filter is measured
+# before it is trusted.
+name: wave0-import
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "probe (read-only) or import (writes to D1)"
+        type: choice
+        options: [probe, import]
+        default: probe
+      release:
+        description: "Overture release"
+        type: string
+        default: "2026-08-19.0"
+      bbox:
+        description: "xmin,ymin,xmax,ymax — the scan window"
+        type: string
+        default: "-98.05,30.05,-97.55,30.55"
+      geo_target_id:
+        description: "geo_targets.id — required for import"
+        type: string
+        default: ""
+      limit:
+        description: "max rows (0 = whole bbox). A non-zero limit is applied after a deterministic ORDER BY."
+        type: string
+        default: "0"
+      min_confidence:
+        description: "Overture confidence floor"
+        type: string
+        default: "0.6"
+
+# One import at a time. Two overlapping runs would both open a ledger row and
+# both insert, and while `dedup_key` would keep the rows unique, the counters
+# would be split across two ledgers and neither would reconcile.
+concurrency:
+  group: wave0-import
+  cancel-in-progress: false
+
+jobs:
+  wave0:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      WORKER_URL: ${{ vars.WORKER_URL || 'https://jepy-worker.radwanlab-official.workers.dev' }}
+      ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Pinned exactly. An unpinned DuckDB can change a parquet reader's
+      # behaviour between a release and a re-run, and then a re-import of the
+      # same dump quietly yields different rows — which looks like a dependency
+      # bug in D1 rather than a version bump in the tool that read the file.
+      - name: Install DuckDB
+        run: python -m pip install --disable-pip-version-check "duckdb==1.5.5"
+
+      - name: Resolve the niche category list from D1
+        if: inputs.mode == 'import'
+        run: |
+          set -euo pipefail
+          echo "NICHES_JSON<<EOF" >> "$GITHUB_ENV"
+          curl -sS -f -H "X-Admin-Secret: ${ADMIN_SECRET}" \
+            "${WORKER_URL}/api/admin/import/niches" >> "$GITHUB_ENV"
+          echo "" >> "$GITHUB_ENV"
+          echo "EOF" >> "$GITHUB_ENV"
+          echo "niches payload:" >&2
+          echo "$NICHES_JSON" >&2
+
+      - name: Run
+        run: |
+          set -euo pipefail
+          IFS=',' read -r XMIN YMIN XMAX YMAX <<< "${{ inputs.bbox }}"
+          python scripts/wave0_import.py \
+            --mode "${{ inputs.mode }}" \
+            --release "${{ inputs.release }}" \
+            --bbox "$XMIN" "$YMIN" "$XMAX" "$YMAX" \
+            --limit "${{ inputs.limit }}" \
+            --min-confidence "${{ inputs.min_confidence }}" \
+            --threads 4 \
+            --geo-target-id "${{ inputs.geo_target_id }}"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### wave0-import (${{ inputs.mode }})"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| release | \`${{ inputs.release }}\` |"
+            echo "| bbox | \`${{ inputs.bbox }}\` |"
+            echo "| limit | \`${{ inputs.limit }}\` |"
+            echo "| min confidence | \`${{ inputs.min_confidence }}\` |"
+            echo "| geo target | \`${{ inputs.geo_target_id }}\` |"
+            echo "| status | \`${{ job.status }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
