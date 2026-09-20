@@ -382,7 +382,11 @@ def run_import(con: duckdb.DuckDBPyConnection, args: argparse.Namespace) -> None
             {
                 "import_id": import_id,
                 "status": status,
-                "error_text": error_text,
+                # Omit an absent error rather than sending `null`: the API is
+                # happy with either now, but a ledger closed by a runner that
+                # sent a key it had nothing to put in it is harder to read than
+                # one closed by a runner that did not.
+                **({"error_text": error_text} if error_text else {}),
                 "duration_sec": duration,
             },
         )

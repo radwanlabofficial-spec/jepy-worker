@@ -153,8 +153,14 @@ const chunkSchema = z.object({
 const finishSchema = z.object({
   import_id: z.string().min(1).max(80),
   status: z.enum(['ok', 'failed']),
-  error_text: z.string().max(1000).optional(),
-  duration_sec: z.number().int().min(0).optional(),
+  // `nullish`, not `optional`. A Python runner that has no error to report sends
+  // `error_text: null`, and `.optional()` accepts `undefined` only — so the one
+  // call that closes a successful import was the one call that failed, and the
+  // ledger stayed `running` with every row already written. The body is built
+  // from named fields in the runner, so `null` is the shape to expect, not the
+  // exception.
+  error_text: z.string().max(1000).nullish(),
+  duration_sec: z.number().int().min(0).nullish(),
 });
 
 /**
