@@ -221,33 +221,42 @@ export async function isCircuitOpen(db: D1Database, scope: string): Promise<bool
 
 export async function recordFailure(db: D1Database, scope: string): Promise<{ opened: boolean }> {
   const now = Math.floor(Date.now() / 1000);
-  await db
+
+  // The increment is ONE statement that reads its own result back. The earlier
+  // version inserted, then SELECTed the count, then decided — a read-modify-write
+  // with a gap in the middle, and the gap is where strikes get lost. Two
+  // concurrent attempts against the same scope could both read 2, both write 3,
+  // and the circuit would sit one failure short of opening while the evidence of
+  // three failures sat in route_attempts. R6 forbids exactly this shape, and the
+  // file above this comment claimed to follow it.
+  const row = await db
     .prepare(
       `INSERT INTO circuit_state (id, scope_key, state, consecutive_failures, updated_at)
        VALUES (?, ?, 'closed', 1, unixepoch())
        ON CONFLICT (scope_key) DO UPDATE SET
          consecutive_failures = circuit_state.consecutive_failures + 1,
-         updated_at = unixepoch()`,
+         updated_at = unixepoch()
+       RETURNING consecutive_failures`,
     )
     .bind(crypto.randomUUID(), scope)
-    .run();
-
-  const row = await db
-    .prepare(`SELECT consecutive_failures FROM circuit_state WHERE scope_key = ?`)
-    .bind(scope)
     .first<{ consecutive_failures: number }>();
 
-  if ((row?.consecutive_failures ?? 0) >= CIRCUIT_THRESHOLD) {
-    await db
-      .prepare(
-        `UPDATE circuit_state SET state = 'open', opened_at = ?, reopen_after = ?, updated_at = unixepoch()
-          WHERE scope_key = ?`,
-      )
-      .bind(now, CIRCUIT_REOPEN_AFTER, scope)
-      .run();
-    return { opened: true };
-  }
-  return { opened: false };
+  const failures = row?.consecutive_failures ?? 0;
+  if (failures < CIRCUIT_THRESHOLD) return { opened: false };
+
+  // The transition to open is guarded rather than unconditional, so a second
+  // caller arriving on the same failure count does not push `opened_at` forward
+  // and silently extend the open window.
+  const opened = await db
+    .prepare(
+      `UPDATE circuit_state
+          SET state = 'open', opened_at = ?, reopen_after = ?, updated_at = unixepoch()
+        WHERE scope_key = ? AND state <> 'open' AND consecutive_failures >= ?`,
+    )
+    .bind(now, CIRCUIT_REOPEN_AFTER, scope, CIRCUIT_THRESHOLD)
+    .run();
+
+  return { opened: (opened.meta.changes ?? 0) > 0 };
 }
 
 export async function recordSuccess(db: D1Database, scope: string): Promise<void> {

@@ -60,22 +60,29 @@ export async function dispatchAdapter(invocation: AdapterInvocation): Promise<Ad
       account_label: invocation.account_label ?? 'unclaimed',
       outcome: 'error',
       error_code: 'E_ADAPTER_UNKNOWN',
-      runner: 'worker',
+      runner: invocation.runner,
     });
   }
 
   try {
     return await adapter.run(invocation);
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    // The message is NOT carried through. A fetch rejection embeds the request
+    // URL in its text, and `api_json` can be configured to carry a key in the
+    // query string (`input.auth_query`). This outcome does not reach storage
+    // today, but one new caller that saved it would put a credential into
+    // `job_results`. So only the error CLASS travels; the text stays in the call
+    // frame, which is the only place the plaintext ever existed (R1, R2).
+    void error;
     return emptyOutcome({
       provider: invocation.provider,
       account_label: invocation.account_label ?? 'unclaimed',
       outcome: 'error',
       error_code: 'E_ADAPTER_THREW',
+      http_status: null,
       raw_ref_r2: null,
-      records: [message.slice(0, 300)],
-      runner: 'worker',
+      records: [],
+      runner: invocation.runner,
     });
   }
 }

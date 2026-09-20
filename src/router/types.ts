@@ -59,6 +59,8 @@ export interface ProviderAccountRow {
   id: string;
   provider: string;
   account_label: string;
+  /** Latest credential's own verdict. `ok` is the only value R20 admits. */
+  credential_status: string | null;
   status: string;
   enabled: number;
   cooldown_until: number | null;
@@ -92,9 +94,6 @@ export interface Candidate {
   source: SourceContext | null;
   /** Every account of this provider that passed the account-level filters. */
   accounts: ProviderAccountRow[];
-  /** Ceiling for this provider's window, from `quota_counters`, when present. */
-  counter_ceiling: number | null;
-  counter_used: number | null;
 }
 
 export interface ScoreComponents {

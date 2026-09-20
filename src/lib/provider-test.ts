@@ -123,9 +123,40 @@ export async function testCredential(provider: string, secret: string): Promise<
           return { status: 'failed', message: 'provider answered HTTP 200 but returned no customer — key not accepted' };
         }
         if (body.can_make_requests === false) {
+          // `/status` is not the last word, and taking it as one has already
+          // produced a wrong answer once: it reported `can_make_requests: false`
+          // with `auth_fail_reason: zone_not_found` for an account whose live
+          // `/request` call against its existing zone returned 200 with a list
+          // page. `can_make_requests` is a cached roll-up, so it lags a zone
+          // created after the key was first used.
+          //
+          // The cheap second opinion is the zone list, which is authoritative
+          // about the thing the flag is a proxy for. It is asked only in the
+          // disagreeing case, so the common path stays one call.
+          const zones = await probe('https://api.brightdata.com/zone/get_active_zones', {
+            headers: { Authorization: `Bearer ${secret}`, 'User-Agent': 'jepy-worker/1.0' },
+          });
+          if (zones.ok) {
+            const list = (await zones.json()) as unknown;
+            // Shape is checked rather than assumed: anything that is not an
+            // array of zone objects proves nothing, and an unverified parse
+            // would silently turn "could not tell" into "requests enabled" —
+            // the same mistake this branch exists to fix.
+            const names = Array.isArray(list)
+              ? list
+                  .map((z) => (z && typeof z === 'object' && 'name' in z ? String((z as { name: unknown }).name) : ''))
+                  .filter((name) => name.length > 0)
+              : [];
+            if (names.length > 0) {
+              return {
+                status: 'ok',
+                message: `key accepted (${body.customer}) — /status reports "${body.auth_fail_reason ?? 'can_make_requests false'}", but the account has ${names.length} active zone(s): ${names.slice(0, 5).join(', ')}. The flag lags the zone, so requests will work.`,
+              };
+            }
+          }
           return {
             status: 'ok',
-            message: `key accepted (${body.customer}) but the account cannot make requests yet: ${body.auth_fail_reason ?? 'unknown reason'} — a zone has to be created in the BrightData dashboard`,
+            message: `key accepted (${body.customer}) but the account cannot make requests yet: ${body.auth_fail_reason ?? 'unknown reason'} — no active zone was listed, so a zone has to be created in the BrightData dashboard`,
           };
         }
         return { status: 'ok', message: `key accepted — ${body.customer}, requests enabled` };

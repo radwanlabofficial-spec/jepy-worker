@@ -50,7 +50,7 @@
 import { buildCandidates } from '../router/candidates';
 import { applyTier0, budgetPressure, loadWeights, rankCandidates, successStats } from '../router/score';
 import { bumpAccountFailure, claimAccount, closeAttempt, openAttempt, setAccountState } from '../router/claim';
-import { recordAttemptFailure, recordAttemptSuccess } from '../router/circuit';
+import { circuitScopeFor, recordAttemptFailure, recordAttemptSuccess } from '../router/circuit';
 import { dispatchAdapter } from '../adapters';
 import { complete, fail } from '../lib/queue';
 import { openSecret } from '../lib/crypto';
@@ -261,21 +261,29 @@ export class RouterDO implements DurableObject {
         };
       }
 
+      const { outcome, spent } = await this.runHop(input, candidate, hops + 1);
+
+      if (!spent) {
+        // The claim came back empty, so no adapter ran. 09 §6 is explicit that
+        // this costs no hop, and the earlier version disagreed with it: it
+        // incremented `hops`, stamped `job_queue.hop_count` and wrote an
+        // `E_NO_ACCOUNT` attempt row for a call that never happened. Three such
+        // refusals parked a job whose budget had never been touched, and the
+        // gap in the hop sequence looked like a lost attempt.
+        notes.push(`hop${hops + 1} ${candidate.provider} → skipped, no claimable account (no hop spent)`);
+        continue;
+      }
+
       hops += 1;
-      // The hop is stamped on the job as it is committed to, not on the way out.
-      // `job_queue.hop_count` is the durable answer to "how many providers has
-      // this job already burned", and a value only written at the end would let
-      // a job that died mid-hop come back with a full budget of three and try
-      // the same three providers again.
-      await this.recordHop(input.job_id, hops);
-
-      const outcome = await this.runHop(input, candidate, hops, () => {
-        budget -= 1;
-      });
-
       notes.push(
         `hop${hops} ${candidate.provider} → ${outcome.outcome}${outcome.error_code ? ` (${outcome.error_code})` : ''}`,
       );
+
+      // The budget is charged what the hop actually cost, not a flat one. A
+      // `directory_html` hop can fetch several pages and the router's own
+      // bookkeeping is three more statements; charging 1 for all of that made
+      // the ceiling unreachable and the number fictional (R15).
+      budget -= Math.max(1, outcome.units) + 3;
 
       if (outcome.outcome === 'success') {
         const resultId = await this.saveResult(input, candidate, outcome, hops);
@@ -301,62 +309,55 @@ export class RouterDO implements DurableObject {
     return { job_id: input.job_id, status: 'needs_manual', hops, note: notes.join(' | ') };
   }
 
-  /** [6]/[7]/[8]/[9] for one hop. */
+  /**
+   * [6]/[7]/[8]/[9] for one hop.
+   *
+   * ORDER MATTERS AND IT IS THE DOCUMENT'S: the claim comes first, and the hop
+   * is stamped only once the claim succeeded. 09 §6 is explicit that an empty
+   * `RETURNING` spends no hop, because nothing external was called — the cheapest
+   * possible failure, and it should cost the cheapest possible amount. The
+   * earlier version did the stamp and the attempt row first and the claim
+   * second, which charged a hop for a call that never left the building.
+   *
+   * `spent` is the caller's signal that the hop counter may move.
+   */
   private async runHop(
     input: RouteInput,
     candidate: ScoredCandidate,
     hop: number,
-    spend: () => void,
-  ): Promise<AdapterOutcome> {
+  ): Promise<{ outcome: AdapterOutcome; spent: boolean }> {
     const db = this.env.DB;
     const now = Math.floor(Date.now() / 1000);
     const sourceId = candidate.source?.source_id ?? null;
 
     // [6] Claim. A credential-free capability has no account to claim, and that
-    // is not a failure — it is the entire point of R10.
+    // is the entire point of R10 rather than a failure.
     let accountLabel: string | null = null;
     let accountId: string | null = null;
 
     if (candidate.requires_credential === 1) {
       const account = await claimAccount(db, candidate.provider, now);
       if (!account) {
-        // Nothing was called, so nothing is logged and no hop is really spent —
-        // but the caller already incremented the hop counter. The attempt row
-        // below records `E_NO_ACCOUNT` so the missing hop is visible rather than
-        // an unexplained gap in the sequence.
-        const attemptId = await openAttempt(db, {
-          job_id: input.job_id,
-          hop,
-          target_type: candidate.target_type,
-          provider: candidate.provider,
-          account_label: null,
-          adapter: candidate.adapter,
-          source_id: sourceId,
-          pack_version: candidate.source?.pack_version ?? null,
-          circuit_scope: `prov:${candidate.provider}`,
-          score: candidate.score,
-          note: 'no claimable account',
-        });
-        await closeAttempt(db, attemptId, {
-          outcome: 'error',
-          http_status: null,
-          records_count: 0,
-          unit_type: null,
-          units: 0,
-          cost_micro: 0,
-          latency_ms: 0,
-          error_text: 'no claimable account — skipped without a call',
-        });
-        return emptyOutcome({
-          provider: candidate.provider,
-          account_label: 'unclaimed',
-          outcome: 'error',
-          error_code: 'E_NO_ACCOUNT',
-        });
+        return {
+          outcome: emptyOutcome({
+            provider: candidate.provider,
+            account_label: 'unclaimed',
+            outcome: 'error',
+            error_code: 'E_NO_ACCOUNT',
+            runner: input.runner,
+          }),
+          spent: false,
+        };
       }
       accountId = account.id;
       accountLabel = account.account_label;
     }
+
+    // The hop is committed HERE — after the claim, before the call. Stamping it
+    // any earlier charges for refusals; stamping it any later lets a worker that
+    // dies mid-call come back with a full budget of three and try the same three
+    // providers again.
+    await this.recordHop(input.job_id, hop);
 
     // [9] The attempt row is opened BEFORE the call, so a crash leaves evidence.
     const attemptId = await openAttempt(db, {
@@ -368,7 +369,11 @@ export class RouterDO implements DurableObject {
       adapter: candidate.adapter,
       source_id: sourceId,
       pack_version: candidate.source?.pack_version ?? null,
-      circuit_scope: candidate.requires_credential === 1 ? `prov:${candidate.provider}:${candidate.target_type}` : null,
+      // The pair scope, always. This column answers "which layer was the circuit
+      // opened at" for a job that is waiting, and the earlier version wrote it
+      // only for credential-bearing hops — so a free hop, which is hop 1 and
+      // therefore the most likely one to be waiting, had no answer at all.
+      circuit_scope: circuitScopeFor.providerTarget(candidate.provider, candidate.target_type),
       score: candidate.score,
       note: null,
     });
@@ -399,7 +404,6 @@ export class RouterDO implements DurableObject {
       }
     };
 
-    spend();
     const outcome = await dispatchAdapter({
       job_id: input.job_id,
       target_type: candidate.target_type,
@@ -407,6 +411,8 @@ export class RouterDO implements DurableObject {
       hop,
       provider: candidate.provider,
       account_label: accountLabel,
+      runner: input.runner,
+      unit_cost_micro: candidate.cost_micro_per_unit,
       credential_ref: credentialRef,
       resolveCredential,
       source: candidate.source,
@@ -417,8 +423,21 @@ export class RouterDO implements DurableObject {
       budget: {
         // A single hop never gets the whole budget: the chain needs room for its
         // remaining hops and for the bookkeeping that closes each one.
+        //
+        // 60 seconds, not 20. A live BrightData list-page fetch measured 26.2 s
+        // from claim to body, so a 20-second ceiling would have timed out the
+        // *first* request of the first hop of the first real job — and a timeout
+        // is recorded as a failure, which is how a healthy provider gets demoted
+        // and a circuit opens on evidence that was never about the provider.
+        //
+        // The ceiling is not the binding constraint from outside: a Durable
+        // Object alarm and a Cron Trigger invocation each get 15 minutes of wall
+        // time, so a 60-second hop sits well inside both. What it does not buy is
+        // three hops running back to back for three minutes unnoticed — the
+        // dispatcher's `*/2` tick overlaps itself in that case, which is exactly
+        // why the claim in `claim.ts` is atomic rather than optimistic.
         remaining_subrequests: 8,
-        deadline_ms: 20_000,
+        deadline_ms: 60_000,
       },
     });
 
@@ -449,7 +468,83 @@ export class RouterDO implements DurableObject {
     });
 
     await this.applyOutcome(candidate, accountId, outcome, now);
-    return outcome;
+    await this.logCredits(input, candidate, outcome);
+    return { outcome, spent: true };
+  }
+
+  /**
+   * R12: BrightData's credit units, written per hop whether or not it worked —
+   * a failed call still consumed the provider's attention, and the log is also
+   * the evidence the credential panel shows.
+   *
+   * The billing rules differ by product and the difference is money:
+   *
+   *   SERP         1 credit per REQUEST, success or not
+   *   Web Unlocker 1 credit per SUCCESSFUL request — failures are free
+   *   Web Scraper  1 credit per RECORD
+   *   Browser API  5 credits per MB
+   *
+   * `daily_bd_credit_guard` sums `credits` from this table, so before this
+   * method existed the guard read an empty table and could never trip. Credit
+   * exhaustion was a hard stop with nothing watching for it (R11).
+   *
+   * Apify's log is NOT written here, and that is a real gap rather than an
+   * omission: `apify_usage_log` wants a `run_id` and compute units, which come
+   * from the actor run's own response. None of the six adapters parses that yet
+   * — the `api_json` path would have to read it out of the run payload, and that
+   * belongs with the Apify wiring in STEP 8.
+   */
+  private async logCredits(
+    input: RouteInput,
+    candidate: ScoredCandidate,
+    outcome: AdapterOutcome,
+  ): Promise<void> {
+    if (candidate.provider !== 'brightdata') return;
+    if (outcome.units <= 0) return;
+
+    // Derived from the adapter, which is the only layer that knows which
+    // BrightData product was used. An unmapped adapter writes NULL rather than a
+    // guess — a wrong zone in the credit log is worse than an absent one,
+    // because the per-zone breakdown is what STEP 0 reads.
+    const zone =
+      candidate.adapter === 'serp_query'
+        ? 'serp'
+        : candidate.adapter === 'directory_html' || candidate.adapter === 'api_json' || candidate.adapter === 'profile_page'
+          ? 'unlocker'
+          : null;
+
+    const success = outcome.outcome === 'success';
+    const credits =
+      zone === 'unlocker'
+        ? success
+          ? outcome.units
+          : 0
+        : outcome.unit_type === 'mb'
+          ? outcome.units * 5
+          : outcome.units;
+
+    try {
+      await this.env.DB.prepare(
+        `INSERT INTO brightdata_credit_log
+           (id, account_label, zone, unit_type, units, credits, cost_micro, job_id, target_type, success, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())`,
+      )
+        .bind(
+          crypto.randomUUID(),
+          outcome.account_label,
+          zone,
+          outcome.unit_type,
+          outcome.units,
+          credits,
+          outcome.cost_micro,
+          input.job_id,
+          candidate.target_type,
+          success ? 1 : 0,
+        )
+        .run();
+    } catch {
+      // Accounting must never fail the routing decision that produced it.
+    }
   }
 
   /**

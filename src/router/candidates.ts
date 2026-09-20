@@ -123,11 +123,24 @@ function pickSource(
     const exact = sources.find((row) => row.id === explicitSourceId);
     if (exact) return exact;
   }
-  return (
-    sources.find(
-      (row) => row.target_type === capability.target_type && row.adapter === capability.adapter,
-    ) ?? null
-  );
+
+  // A disabled source is not a candidate source. The column was already being
+  // selected and simply not used, which meant a switched-off directory could
+  // still win the lookup and then be judged on its class and block reason.
+  const matches = sources
+    .filter(
+      (row) =>
+        row.enabled === 1 &&
+        row.target_type === capability.target_type &&
+        row.adapter === capability.adapter,
+    )
+    // Deterministic. Without an order, a second source sharing the same
+    // (target_type, adapter) pair would decide a Class X or Class C verdict by
+    // row order — the kind of bug that appears once, in production, and cannot
+    // be reproduced.
+    .sort((a, b) => (a.source_key < b.source_key ? -1 : a.source_key > b.source_key ? 1 : 0));
+
+  return matches[0] ?? null;
 }
 
 function toSourceContext(source: SourceRow | null, pack: PackRow | null): SourceContext | null {
@@ -201,9 +214,18 @@ export async function buildCandidates(
       .all<PackRow>(),
     db
       .prepare(
-        `SELECT id, provider, account_label, status, enabled, cooldown_until, quota_limit, quota_used,
-                quota_window, quota_expires_at, daily_limit, daily_used, last_used_at, priority
-           FROM provider_accounts`,
+        // `credential_status` rides along because R20 has a second half that is
+        // easy to miss: a credential that is `untested` or `failed` must never
+        // reach the candidate list at all. Reading it here is what makes that
+        // possible before scoring, instead of relying on the account's own
+        // `status` column as an accidental proxy.
+        `SELECT a.id, a.provider, a.account_label, a.status, a.enabled, a.cooldown_until,
+                a.quota_limit, a.quota_used, a.quota_window, a.quota_expires_at,
+                a.daily_limit, a.daily_used, a.last_used_at, a.priority,
+                (SELECT c.test_status FROM provider_credentials c
+                  WHERE c.account_id = a.id
+                  ORDER BY c.rotated_at IS NULL DESC, c.created_at DESC LIMIT 1) AS credential_status
+           FROM provider_accounts a`,
       )
       .all<ProviderAccountRow>(),
   ]);
@@ -289,27 +311,72 @@ export async function buildCandidates(
 
     const pool = accountsByProvider.get(capability.provider) ?? [];
 
-    // 5. Credential. A capability that needs a key, on a provider with no
-    // account row at all, is a configuration error rather than a candidate.
-    if (capability.requires_credential === 1 && pool.length === 0) {
-      drop('no_credential');
-      continue;
+    if (capability.requires_credential === 1) {
+      // 5. Credential. "No claimable account" — the document's words — is a
+      // stricter test than "no account row", and the difference is the whole
+      // point of the filter: an account that exists but cannot be claimed is not
+      // a candidate, and treating it as one produced a routing refusal that only
+      // showed up much later, inside the claim, after a hop had been charged.
+      if (pool.length === 0) {
+        drop('no_credential');
+        continue;
+      }
+
+      // R20's co-rule: `untested` and `failed` credentials never reach the
+      // candidate list — dropped first, in the hard filters. This is not the
+      // same question as the account's own `status`; a credential can be dead
+      // while the account still says `active`, and until this check existed the
+      // only thing standing between a dead key and the router was that accident.
+      const hasHealthyCredential = pool.some((account) => account.credential_status === 'ok');
+      if (!hasHealthyCredential) {
+        drop('credential_unhealthy');
+        continue;
+      }
     }
 
-    // 8, 9 and 7 together: is there at least one account that could be claimed?
-    // Filter 8 is entitlement expiry, 9 is cooldown, 7 is the window ceiling.
-    const hasExpiredEntitlement =
-      pool.length > 0 &&
-      pool.every((account) => account.quota_expires_at !== null && account.quota_expires_at <= now);
-    if (hasExpiredEntitlement) {
+    // 8, 7 and 9, in the document's order, each reported under its own name.
+    // They were previously collapsed into one `cooldown_or_quota` bucket, which
+    // told an operator that SOMETHING was wrong with the account without saying
+    // which of three unrelated things it was — and the three need different
+    // reactions: an expired entitlement is a purchase, a ceiling is a rollover,
+    // a cooldown is patience.
+    if (pool.length > 0 && pool.every((account) => account.quota_expires_at !== null && account.quota_expires_at <= now)) {
       drop('quota_expired');
       continue;
     }
 
-    const hasCoolingAccount = pool.length > 0 && pool.every((account) => !accountIsClaimable(account, now));
-    if (hasCoolingAccount) {
-      drop('cooldown_or_quota');
+    const claimable = pool.filter((account) => accountIsClaimable(account, now));
+    if (pool.length > 0 && claimable.length === 0) {
+      const atCeiling = pool.some(
+        (account) => account.quota_limit !== null && account.quota_limit > 0 && account.quota_used >= account.quota_limit,
+      );
+      const counterSpent = pool.some((account) => {
+        const counter = counterByKey.get(`${capability.provider}\u0000${account.account_label}`);
+        return counter?.limit_value !== null && counter?.limit_value !== undefined && (counter.used ?? 0) >= counter.limit_value;
+      });
+      if (atCeiling || counterSpent) {
+        drop('quota_exhausted');
+      } else {
+        drop('cooldown');
+      }
       continue;
+    }
+
+    // 7. The window ceiling has to be checked HERE, before scoring, and not only
+    // inside the claim. A counter's own limit is a different wall from the
+    // account's quota, and leaving it to the claim meant a candidate could win
+    // scoring, cost a hop, and only then be refused by a number the router had
+    // already read and thrown away.
+    if (pool.length > 0) {
+      const everyCounterSpent = pool.every((account) => {
+        const counter = counterByKey.get(`${capability.provider}\u0000${account.account_label}`);
+        if (!counter || counter.limit_value === null || counter.limit_value === undefined) return false;
+        return (counter.used ?? 0) >= counter.limit_value;
+      });
+      if (everyCounterSpent) {
+        drop('quota_counter_exhausted');
+        continue;
+      }
     }
 
     // Credential-free capabilities have no account to claim, so their circuit is
@@ -333,7 +400,6 @@ export async function buildCandidates(
     }
 
     const pack = sourceRow ? (packByKey.get(sourceRow.source_key) ?? null) : null;
-    const counter = counterByKey.get(`${capability.provider}\u0000${pool[0]?.account_label ?? ''}`) ?? null;
 
     candidates.push({
       capability_id: capability.id,
@@ -351,9 +417,7 @@ export async function buildCandidates(
       compliance_flag: capability.compliance_flag,
       priority: capability.priority,
       source: toSourceContext(sourceRow, pack),
-      accounts: pool.filter((account) => accountIsClaimable(account, now)),
-      counter_ceiling: counter?.limit_value ?? null,
-      counter_used: counter?.used ?? null,
+      accounts: claimable,
     });
   }
 

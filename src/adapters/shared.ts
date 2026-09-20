@@ -47,6 +47,13 @@ export interface AdapterInvocation {
   hop: number;
   provider: string;
   account_label: string | null;
+  /** Which runner is executing: `worker`, `gha` or `extension`. Reported back so
+   *  the attempt row says who really ran it, not who usually does. */
+  runner: string;
+  /** `provider_capability.cost_micro_per_unit`. The router owns the price; the
+   *  adapter multiplies it by the units it actually used, because the adapter is
+   *  the only layer that knows how many units that was. */
+  unit_cost_micro: number | null;
   credential_ref: CredentialRef | null;
   /** Resolves the reference to plaintext. Called at most once, inside the adapter. */
   resolveCredential: () => Promise<string | null>;
@@ -120,21 +127,27 @@ export function buildOutcome(
   },
 ): AdapterOutcome {
   const records = over.records ?? [];
+  const units = over.units ?? 0;
   return emptyOutcome({
     provider: invocation.provider,
     account_label: invocation.account_label ?? 'unclaimed',
     records,
     records_count: records.length,
     outcome: over.outcome,
-    units: over.units ?? 0,
+    units,
     unit_type: over.unit_type ?? null,
-    cost_micro: over.cost_micro ?? 0,
+    // Priced here and nowhere else. Until this line existed every adapter
+    // reported cost_micro = 0, which made the 40%-weighted cost term in the
+    // router score meaningless and left `brightdata_credit_log` empty — and the
+    // daily budget guard sums that table, so it could never trip. The budget
+    // model rested on a number no code produced.
+    cost_micro: over.cost_micro ?? (invocation.unit_cost_micro ?? 0) * units,
     latency_ms: over.latency_ms,
     http_status: over.http_status ?? null,
     error_code: over.error_code ?? null,
     cursor: over.cursor ?? null,
     raw_ref_r2: over.raw_ref_r2 ?? null,
-    runner: 'worker',
+    runner: invocation.runner,
   });
 }
 
