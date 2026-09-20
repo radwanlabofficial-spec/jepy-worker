@@ -19,6 +19,33 @@ export interface Env {
    */
   ROUTER_DO: DurableObjectNamespace;
 
+  /**
+   * KV: cache only, never a source of truth.
+   *
+   * robots.txt, the 24-hour Yelp window, domain enrichment and the credential
+   * cache live here, each entry carrying a `cache_epoch`. The test of a correct
+   * KV entry is that wiping the namespace changes nothing but latency — if a
+   * value survives only in KV, that is a bug in where it was stored, not a
+   * property of the cache.
+   *
+   * Declared rather than optional, for the same reason as `ROUTER_DO`: a missing
+   * binding should fail loudly, while `CACHE?.get(...)` would answer "no cached
+   * value" forever and every request would quietly pay full price.
+   */
+  CACHE: KVNamespace;
+
+  /**
+   * R2: job payloads, parquet staging for the import workflow, raw adapter
+   * bodies worth re-parsing, and the weekly vault export.
+   *
+   * One bucket per account, not per environment: objects are addressed by key,
+   * so `preview/` and production can share `jepy-raw`, and a lifecycle rule
+   * expires the `preview/` prefix after seven days. KV cannot be shared this
+   * way — `cache_epoch` and credential-cache entries would leak across
+   * environments — which is why there are two namespaces and one bucket.
+   */
+  RAW: R2Bucket;
+
   /** Cloudflare Access: the Zero Trust team domain, e.g. `hidden-mouse-a469.cloudflareaccess.com`. */
   ACCESS_TEAM_DOMAIN: string;
   /** Cloudflare Access: this application's `aud`, checked on every human request. */

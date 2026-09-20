@@ -33,9 +33,25 @@ class_name = "RouterDO"
 tag = "v1"
 new_sqlite_classes = ["RouterDO"]
 
-# KV and R2 are still to come: the cache and the raw-body store arrive with the
-# adapters' storage step. They are deliberately absent rather than placeholdered —
-# a binding that points nowhere fails at request time, not at deploy time.
+# KV — cache only (robots.txt, the 24-hour Yelp window, domain enrichment, the
+# credential cache), every entry carrying a `cache_epoch`. Flushing this
+# namespace must cost nothing but latency; a value that exists only here is
+# stored in the wrong place.
+[[kv_namespaces]]
+binding = "CACHE"
+id = "69095062db6f4189b0c67a23a3ad2d57"
+
+# R2 — job payloads, parquet staging for the import workflow, raw adapter bodies
+# worth re-parsing, and the weekly vault export.
+#
+# One bucket for both environments on purpose: objects are addressed by key, so
+# `preview/` and production coexist, and the bucket's lifecycle rule expires the
+# `preview/` prefix after seven days. KV is the opposite case and needs two
+# namespaces, because a shared `cache_epoch` or credential-cache entry would let
+# a preview run invalidate production's cache.
+[[r2_buckets]]
+binding = "RAW"
+bucket_name = "jepy-raw"
 
 # TWO triggers carry NINE jobs (11-api-contract.md §11 lists the jobs, not the
 # triggers). Cloudflare caps the number of cron triggers per Worker, so one
@@ -62,4 +78,62 @@ ACCESS_TEAM_DOMAIN = "hidden-mouse-a469.cloudflareaccess.com"
 ACCESS_AUD = "a24977c8380f68525efe2696528c94e8114f4b7a71a6936f7e172331c263616a"
 # Only consulted if a browser calls the API cross-origin; the console normally
 # goes through the same-origin Pages proxy and never needs this.
+CONSOLE_ORIGIN = "https://jepy-dashboard.pages.dev"
+
+# ---------------------------------------------------------------------------
+# Preview
+# ---------------------------------------------------------------------------
+#
+# A named environment inherits `main`, `compatibility_date` and the other
+# environment-agnostic keys — and inherits NONE of the bindings. Every binding
+# below is redeclared on purpose, because the failure mode of forgetting one is
+# not a deploy error: the preview Worker deploys happily, loses the binding, and
+# surfaces the problem later as a confusing 500 in whichever request touches it
+# first. `wrangler deploy --env preview` is therefore also the smoke check.
+#
+# What preview must NOT share is anything whose state crosses environments:
+#   - D1 `jepy-preview`, not `jepy-leads`. A preview test run against the real
+#     database would consume real provider quota and corrupt real rows.
+#   - KV `jepy-cache-preview`. A shared `cache_epoch` or credential-cache entry
+#     would let a preview run invalidate production's cached credentials.
+#   - Its own `VAULT_KEY` and `ADMIN_SECRET`, so preview's own credential set can
+#     never decrypt production ciphertext. (Secrets are set per environment with
+#     `wrangler secret put --env preview` and cannot be declared in this file.)
+# R2 is the deliberate exception — see the `RAW` binding above.
+[env.preview]
+name = "jepy-worker-preview"
+workers_dev = true
+
+[[env.preview.d1_databases]]
+binding = "DB"
+database_name = "jepy-preview"
+database_id = "2b408d81-144f-41d8-9966-76d096d2f11f"
+
+[[env.preview.kv_namespaces]]
+binding = "CACHE"
+id = "15210016611047e4a11fb27d62b6c08f"
+
+[[env.preview.r2_buckets]]
+binding = "RAW"
+bucket_name = "jepy-raw"
+
+[[env.preview.durable_objects.bindings]]
+name = "ROUTER_DO"
+class_name = "RouterDO"
+
+[[env.preview.migrations]]
+tag = "v1"
+new_sqlite_classes = ["RouterDO"]
+
+# Empty on purpose. A preview Worker that dispatched jobs on a timer would spend
+# the same shared free-tier provider quota that production depends on, and quota
+# is the scarcest resource this system has. Preview runs code paths on demand,
+# never on a clock, and any job can still be forced with POST /api/admin/run-cron.
+[env.preview.triggers]
+crons = []
+
+[env.preview.vars]
+ENVIRONMENT = "preview"
+ACCESS_TEAM_DOMAIN = "hidden-mouse-a469.cloudflareaccess.com"
+ACCESS_AUD = "a24977c8380f68525efe2696528c94e8114f4b7a71a6936f7e172331c263616a"
 CONSOLE_ORIGIN = "https://jepy-dashboard.pages.dev"
