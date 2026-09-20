@@ -66,19 +66,41 @@ def bbox_clause(bbox: tuple[float, float, float, float]) -> str:
     )
 
 
-def category_list(niches_json: str) -> list[str]:
-    """The Overture taxonomy values to import, flattened from the niche rows.
+def parse_niches(niches_json: str) -> list[dict]:
+    """The niche rows, fetched from D1 rather than hard-coded here.
 
-    Read from the database rather than hard-coded here, so adding a niche is a
-    row and not a deploy.
+    Read from the database so that adding a niche is a row and not a deploy, and
+    read through the Worker so there is one source of truth rather than a copy in
+    this file that drifts.
     """
     niches = json.loads(niches_json)
+    if not isinstance(niches, list):
+        raise SystemExit("niches payload is not a list — expected the `.data.niches` array")
+    return niches
+
+
+def category_list(niches: list[dict]) -> list[str]:
     values: list[str] = []
     for niche in niches:
         for value in niche.get("overture_categories", []):
             if value not in values:
                 values.append(value)
     return values
+
+
+def category_to_niche(niches: list[dict]) -> dict[str, str]:
+    """Overture category -> our niche slug.
+
+    One category can only belong to one niche: the mapping is flattened, and a
+    category listed under two niches would make `leads.niche` depend on the order
+    the rows came back in. The last writer wins here, and the probe prints the
+    mapping so a collision is visible rather than mysterious.
+    """
+    mapping: dict[str, str] = {}
+    for niche in niches:
+        for value in niche.get("overture_categories", []):
+            mapping[value] = niche["niche_slug"]
+    return mapping
 
 
 def sql_values(values: list[str]) -> str:
@@ -107,7 +129,8 @@ SELECT
   addresses[1].freeform             AS address_line,
   addresses[1].locality             AS city,
   addresses[1].region               AS region,
-  addresses[1].postcode             AS postal_code,
+  addresses[1].postcode            AS postal_code,
+  addresses[1].country             AS country_code,
   (bbox.xmin + bbox.xmax) / 2       AS lng,
   (bbox.ymin + bbox.ymax) / 2       AS lat
 FROM read_parquet('{glob}')
@@ -195,10 +218,11 @@ def run_probe(con: duckdb.DuckDBPyConnection, args: argparse.Namespace) -> None:
     bbox = tuple(args.bbox)
 
     log("schema of one part:")
-    for column, kind in con.execute(
-        f"DESCRIBE SELECT * FROM read_parquet('{glob}') LIMIT 0"
-    ).fetchall():
-        print(f"    {column:22s} {kind}")
+    # `DESCRIBE` returns six columns (name, type, null, key, default, extra), not
+    # two. Take the first two by index rather than unpacking the row, so a future
+    # DuckDB that adds a seventh does not break the probe.
+    for row in con.execute(f"DESCRIBE SELECT * FROM read_parquet('{glob}') LIMIT 0").fetchall():
+        print(f"    {str(row[0]):22s} {row[1]}")
 
     log("top taxonomy values inside the bbox (all rows, any category):")
     rows = con.execute(
@@ -226,8 +250,12 @@ def run_probe(con: duckdb.DuckDBPyConnection, args: argparse.Namespace) -> None:
     for category, count in rows:
         print(f"    {category:44s} {count:>8}")
 
-    if args.niches_json:
-        categories = category_list(args.niches_json)
+    if args.niches_json and args.niches_json.strip() != "[]":
+        niches = parse_niches(args.niches_json)
+        categories = category_list(niches)
+        log("configured niches and the Overture categories they claim:")
+        for niche in niches:
+            print(f"    {niche['niche_slug']:16s} -> {', '.join(niche['overture_categories'])}")
         log(f"the {len(categories)} configured categories, counted in this bbox:")
         rows = con.execute(
             f"""
@@ -252,7 +280,9 @@ def run_import(con: duckdb.DuckDBPyConnection, args: argparse.Namespace) -> None
     if not args.geo_target_id:
         raise SystemExit("--geo-target-id is required for import mode")
 
-    categories = category_list(args.niches_json)
+    niches = parse_niches(args.niches_json)
+    categories = category_list(niches)
+    to_niche = category_to_niche(niches)
     glob = parquet_glob(args.release)
     started = time.time()
 
@@ -304,15 +334,27 @@ def run_import(con: duckdb.DuckDBPyConnection, args: argparse.Namespace) -> None
     try:
         for record in cursor.fetchall():
             row = dict(zip(columns, record))
-            row["domain"] = domain_of(row.pop("website", None))
-            row["country_code"] = "US"
-            # `basic_category` is carried into provenance by the Worker; the lead
-            # itself stores the taxonomy value it was imported under.
-            row["niche"] = None
+
+            website = row.pop("website", None)
+            row["website_url"] = website
+            row["domain"] = domain_of(website)
+
+            # The address's own country is preferred and `US` is the fallback:
+            # the bbox decides what is scanned, but a row whose address block is
+            # missing would otherwise be stored with no country at all, and a
+            # lead with no country cannot be checked against a sending rule.
+            row["country_code"] = row.get("country_code") or "US"
+
+            # `basic_category` is the dump's coarse bucket; it rides along into
+            # provenance so a later re-bucketing does not need the dump again.
+            # `niche` is ours, set from the mapping the niches table defines.
+            row["niche"] = to_niche.get(row.get("category") or "", None)
+
             for key, value in list(row.items()):
                 if value is not None and not isinstance(value, (str, int, float, bool)):
                     row[key] = str(value)
-            row["confidence"] = float(row["confidence"]) if row.get("confidence") is not None else None
+            if row.get("confidence") is not None:
+                row["confidence"] = float(row["confidence"])
             chunk.append(row)
             if len(chunk) >= CHUNK_ROWS:
                 inserted, deduped = flush(chunk, chunk_index)

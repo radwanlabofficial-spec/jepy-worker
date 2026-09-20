@@ -80,13 +80,20 @@ jobs:
         if: inputs.mode == 'import'
         run: |
           set -euo pipefail
-          echo "NICHES_JSON<<EOF" >> "$GITHUB_ENV"
-          curl -sS -f -H "X-Admin-Secret: ${ADMIN_SECRET}" \
-            "${WORKER_URL}/api/admin/import/niches" >> "$GITHUB_ENV"
-          echo "" >> "$GITHUB_ENV"
-          echo "EOF" >> "$GITHUB_ENV"
-          echo "niches payload:" >&2
-          echo "$NICHES_JSON" >&2
+          # `.data.niches`, not the whole envelope: the Worker answers
+          # `{ ok, data }`, and handing the script the envelope would make it
+          # iterate the wrapper instead of the list.
+          payload=$(curl -sS -f -H "X-Admin-Secret: ${ADMIN_SECRET}" \
+            "${WORKER_URL}/api/admin/import/niches" | jq -c '.data.niches')
+          echo "niches payload: ${payload}" >&2
+          # `-f` above means a refused request fails the step here rather than
+          # downstream, where an empty category list would look like a filter
+          # that matched nothing instead of a credential that did not work.
+          {
+            echo "NICHES_JSON<<EOF"
+            echo "$payload"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
 
       - name: Run
         run: |

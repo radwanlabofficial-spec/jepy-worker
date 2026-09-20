@@ -125,7 +125,12 @@ const rowSchema = z.object({
   lat: z.number().nullish(),
   lng: z.number().nullish(),
   category: z.string().max(200).nullish(),
+  basic_category: z.string().max(120).nullish(),
   niche: z.string().max(120).nullish(),
+  // Not written to a `leads` column — there is none — but kept in the schema so
+  // it survives validation and lands in `provenance_json`. Zod drops unknown
+  // keys silently, and a silently dropped confidence is a filter threshold with
+  // no record of which side of it a row fell on.
   confidence: z.number().nullish(),
 });
 
@@ -298,8 +303,17 @@ importRoutes.post('/admin/import/chunk', async (c) => {
 
   let inserted = 0;
   if (statements.length > 0) {
-    const results = await c.env.DB.batch(statements);
-    for (const result of results) inserted += result.meta.changes ?? 0;
+    // Sent in batches of 100 rather than as one call. A batch has a ceiling, and
+    // discovering it halfway through a slice would leave the ledger short of what
+    // actually landed — the one failure this ledger exists to make impossible.
+    // `rows_inserted` is computed from the applied statements, so a partial
+    // failure under-reports rather than over-reports, and the `dedup_key` index
+    // means replaying the slice costs a wasted request and no duplicate rows.
+    const BATCH_SIZE = 100;
+    for (let offset = 0; offset < statements.length; offset += BATCH_SIZE) {
+      const results = await c.env.DB.batch(statements.slice(offset, offset + BATCH_SIZE));
+      for (const result of results) inserted += result.meta.changes ?? 0;
+    }
   }
   const deduped = input.rows.length - inserted;
 
