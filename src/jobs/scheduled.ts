@@ -56,6 +56,13 @@ export async function runTick(env: Env, now = new Date()): Promise<string[]> {
   await runScheduled(CRONS.budgetGuard, env);
   ran.push('budget_guard');
 
+  // Also hourly, and recorded under its own name rather than folded into the
+  // budget guard: a device going quiet is not a spending event, and a silent
+  // device is exactly the thing that is hard to notice. It keeps its own row in
+  // cron_runs so "when did this extension last speak?" has an answer.
+  await record(env, 'device_sweep', () => sweepStaleDevices(env));
+  ran.push('device_sweep');
+
   if (hour === 0) {
     await runScheduled(CRONS.quotaRollover, env);
     ran.push('quota_rollover');
@@ -85,6 +92,42 @@ export async function runTick(env: Env, now = new Date()): Promise<string[]> {
     ran.push('weekly_backup');
   }
   return ran;
+}
+
+/**
+ * A device silent for forty-eight hours is `stale`.
+ *
+ * `stale` is a statement about silence, not about failure, and the sweep does
+ * nothing else: it does not queue work, retry anything, or revoke. A stale device
+ * is one the operator should look at, and the honest thing to do is label it and
+ * stop assuming it will answer.
+ *
+ * Silence is measured from `last_heartbeat_at`, falling back to `created_at`.
+ * Without the fallback a device that was issued and never used would never be
+ * flagged at all — it has no last contact to be measured from, and "never spoke"
+ * is the most silent a device can be.
+ *
+ * `revoke` is left alone: a revoked device is already in the state that matters,
+ * and the sweep must not overwrite the record of the decision.
+ */
+const DEVICE_STALE_AFTER_SECONDS = 48 * 3600;
+
+async function sweepStaleDevices(env: Env): Promise<{ dispatched: number; note?: string }> {
+  const result = await env.DB.prepare(
+    `UPDATE devices
+        SET status = 'stale'
+      WHERE status = 'active'
+        AND current_directive != 'revoke'
+        AND COALESCE(last_heartbeat_at, created_at) <= unixepoch() - ?`,
+  )
+    .bind(DEVICE_STALE_AFTER_SECONDS)
+    .run();
+
+  const silent = result.meta.changes ?? 0;
+  return {
+    dispatched: silent,
+    note: silent === 0 ? 'every device has spoken within 48h' : `${silent} device(s) went silent`,
+  };
 }
 
 export type CronName = keyof typeof CRONS;

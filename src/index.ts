@@ -16,6 +16,7 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { fail, ok } from './lib/envelope';
 import { requireActor } from './middleware/auth';
+import { isDevicePath } from './middleware/device';
 import type { Actor, Env } from './env';
 
 import { healthRoutes, meRoutes } from './routes/health';
@@ -31,6 +32,7 @@ import { miscRoutes } from './routes/misc';
 import { importRoutes } from './routes/imports';
 import { normaliseRoutes } from './routes/normalise';
 import { runnerRoutes } from './routes/runners';
+import { deviceRoutes } from './routes/device';
 import { CRONS, TRIGGERS, runScheduled, runTick } from './jobs/scheduled';
 import { cancel, enqueue, retry } from './lib/queue';
 import { z } from 'zod';
@@ -57,11 +59,28 @@ app.use('/api/*', async (c, next) => {
 
 app.use('/api/*', async (c, next) => {
   // Health is the probe Cloudflare and the operator use; it must answer before
-  // any credential exists. Everything else needs an identity.
+  // any credential exists.
   if (c.req.path === '/api/health') {
     await next();
     return;
   }
+
+  // The OTHER door. A browser extension has no Access session and must not hold
+  // the admin secret, so it presents a device token instead — and this guard has
+  // to let it past to reach `requireDevice`, which is the thing that actually
+  // checks the token. ADR-035 fixes the list at three paths and `isDevicePath`
+  // owns it, so this is a reference rather than a second copy.
+  //
+  // Without this, every device endpoint answered 401 from HERE and never reached
+  // its own check: the extension would have been dead on arrival in production
+  // while passing every test locally, because the dev loopback bypass satisfies
+  // the human guard without anyone noticing it was the wrong guard.
+  if (isDevicePath(c.req.method, c.req.path)) {
+    await next();
+    return;
+  }
+
+  // Everything else needs a human or the admin secret.
   return requireActor(c, next);
 });
 
@@ -95,6 +114,7 @@ app.route('/api', miscRoutes);
 app.route('/api', importRoutes);
 app.route('/api', normaliseRoutes);
 app.route('/api', runnerRoutes);
+app.route('/api', deviceRoutes);
 
 app.notFound((c) => {
   const { body, status } = fail('E_NOT_FOUND');
@@ -185,21 +205,32 @@ app.post('/api/admin/run-cron', async (c) => {
     return c.json(body, status as 400);
   }
 
+  // THE HOURLY EXPRESSION IS NOT ONE JOB. The hourly TRIGGER calls `runTick`,
+  // which decides from the clock which of the eight other jobs are due. Asking
+  // for '0 * * * *' used to run the budget guard alone, so the six jobs that only
+  // run at particular hours — and anything `runTick` grows later — could not be
+  // exercised on demand at all, which is precisely the situation this endpoint
+  // exists to prevent. Now the expression does what the trigger does.
+  const names =
+    parsed.data.cron === TRIGGERS.hourly
+      ? await runTick(c.env)
+      : [await runScheduled(parsed.data.cron, c.env)];
+
   // The name the run was recorded under comes back from the scheduler itself,
   // so the endpoint never has to guess it from the expression.
-  const cronName = await runScheduled(parsed.data.cron, c.env);
+  const cronName = names.join(',');
 
   const last = await c.env.DB.prepare(
     `SELECT cron_name, status, error_text, jobs_dispatched, finished_at
        FROM cron_runs
-      WHERE cron_name = ? AND started_at >= ?
+      WHERE cron_name IN (${names.map(() => '?').join(', ')}) AND started_at >= ?
       ORDER BY started_at DESC, finished_at DESC
       LIMIT 1`,
   )
-    .bind(cronName, Math.floor(Date.now() / 1000) - 300)
+    .bind(...names, Math.floor(Date.now() / 1000) - 300)
     .first();
 
-  return c.json(ok({ cron: parsed.data.cron, cron_name: cronName, last }));
+  return c.json(ok({ cron: parsed.data.cron, cron_name: cronName, ran: names, last }));
 });
 
 app.get('/api/admin/cron-runs', async (c) => {
