@@ -33,6 +33,10 @@ def call(base: str, secret: str, method: str, path: str, body: dict | None = Non
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(base + path, data=data, method=method)
     req.add_header("X-Admin-Secret", secret)
+    # Cloudflare answers a request with no User-Agent with `error code: 1010` and
+    # HTTP 403 — a banned-client response that reads like an auth failure and is
+    # not one. `wave0_import.py` sends an agent too; this is why.
+    req.add_header("User-Agent", "jepy-backfill/1.0")
     if data:
         req.add_header("Content-Type", "application/json")
     try:
