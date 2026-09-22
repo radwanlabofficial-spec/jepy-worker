@@ -60,13 +60,45 @@ export async function enqueue(db: D1Database, input: EnqueueInput): Promise<stri
 }
 
 /**
- * Takes up to `limit` due jobs in one statement.
+ * Which process is expected to carry the job out.
+ *
+ * `worker` is the cron dispatcher inside this Worker. `gha` and `extension` are
+ * OUTSIDE it: GitHub Actions and the browser extension. A job declares its runner
+ * in its own payload, because the job's author knows who can do the work and the
+ * claimer only knows what is due.
+ */
+export type RunnerKind = 'worker' | 'gha' | 'extension';
+
+/**
+ * Takes up to `limit` due jobs for ONE runner, in a single statement.
  *
  * The inner SELECT picks the rows; the outer UPDATE stamps them. Because it is a
  * single statement, two concurrent callers cannot both win the same row — the
  * second sees nothing left to take.
+ *
+ * THE RUNNER FILTER IS THE WHOLE POINT OF THE PARAMETER. Before it existed, the
+ * cron dispatcher claimed every pending job and handed it to the router, which
+ * then had to pick a provider for work no provider in this Worker can do: a
+ * `dataset_import` job is carried out by GitHub Actions reading a 10 GB parquet
+ * dump, and there is no adapter for that. The router found the matching
+ * `gha_runner` capability, ran its adapter anyway — `api_json`, with no URL
+ * template — and parked the job as `needs_manual` with `E_CONFIG_MISSING`. Every
+ * cron tick produced more of them.
+ *
+ * A job for an external runner is not work this Worker cannot finish; it is a
+ * request that someone else should. So it stays `pending` and the runner that was
+ * asked takes it, via `/api/admin/jobs/claim`.
+ *
+ * `json_valid` guards the extraction: a payload that will not parse must not make
+ * the claim statement throw and stop the whole queue. An unreadable payload is
+ * treated as `worker`, which is what a job with no declared runner means.
  */
-export async function claim(db: D1Database, workerId: string, limit: number): Promise<ClaimedJob[]> {
+export async function claim(
+  db: D1Database,
+  workerId: string,
+  limit: number,
+  runner: RunnerKind = 'worker',
+): Promise<ClaimedJob[]> {
   const result = await db
     .prepare(
       `UPDATE job_queue
@@ -75,12 +107,16 @@ export async function claim(db: D1Database, workerId: string, limit: number): Pr
           SELECT id FROM job_queue
            WHERE status = 'pending'
              AND (run_after IS NULL OR run_after <= unixepoch())
+             AND COALESCE(
+                   CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.runner') END,
+                   'worker'
+                 ) = ?3
            ORDER BY priority DESC, created_at ASC
            LIMIT ?2
         )
       RETURNING id, job_type, target_type, payload_json, attempts, max_attempts, hop_count`,
     )
-    .bind(workerId, limit)
+    .bind(workerId, limit, runner)
     .all<ClaimedJob>();
   return (result.results ?? []) as ClaimedJob[];
 }

@@ -189,19 +189,18 @@ async function dispatcher(env: Env): Promise<{ dispatched: number; note?: string
 
     const payload = safeParse(job.payload_json);
 
-    // The runner is the JOB's context, not the dispatcher's assumption. Most
-    // work is `worker`, but a dataset import is enqueued for the GHA runner and
-    // an extension capture for the extension, and filter 10 compares the two.
-    // Hard-coding `worker` here would have made every gha-runner-only target
-    // (`overture_places`, `osm_overpass`, `fsq_places`) look like it had no
-    // candidates at all — a routing failure that would have been blamed on the
-    // seed. An unknown value falls back to `worker`, which is the runner that
-    // this tick actually is.
-    const declaredRunner = payload?.runner;
-    const runner =
-      declaredRunner === 'gha' || declaredRunner === 'extension' || declaredRunner === 'worker'
-        ? declaredRunner
-        : 'worker';
+    // Fixed, and not read back out of the payload. `claim(..., 'worker')` above
+    // takes only jobs that declare no runner or declare `worker`, so by the time
+    // a job reaches this line the answer is already settled — and reading it a
+    // second time would only let the two disagree.
+    //
+    // Jobs for GitHub Actions and for the extension are not claimed here at all.
+    // They wait in the queue for the runner that was asked, which takes them
+    // through `/api/admin/jobs/claim`. Sending them to the router instead is what
+    // produced a `needs_manual` row on every tick: the router picked the matching
+    // `gha_runner` capability and then ran its adapter, `api_json`, which has no
+    // URL to fetch and answered `E_CONFIG_MISSING`.
+    const runner = 'worker';
 
     const stub = env.ROUTER_DO.get(env.ROUTER_DO.idFromName(job.target_type));
     const response = await stub.fetch('https://router.internal/route', {
@@ -414,12 +413,22 @@ async function feedbackLoop(env: Env): Promise<{ note?: string }> {
   return { note: `${events} events — lift computation deferred to the scoring phase` };
 }
 
-/** Wave 0 import: the Worker enqueues, GitHub Actions does the heavy lifting. */
+/**
+ * Wave 0 import: the Worker enqueues, GitHub Actions does the heavy lifting.
+ *
+ * THE TARGET TYPES ARE `overture_places` AND `fsq_places`, which is what the seed
+ * declares. They used to be `overture` and `fsq`, and that pair appears nowhere in
+ * `provider_capability` — so `buildCandidates` found nothing, `RouterDO` answered
+ * `no enabled capability row for this target_type at all`, and every tick left two
+ * more `needs_manual` rows behind. A name in code that no row in the database
+ * carries is a filter that matches nothing, and the failure looks like a routing
+ * bug rather than a typo.
+ */
 async function datasetImport(env: Env): Promise<{ dispatched: number; note?: string }> {
   const targets = await env.DB.prepare(`SELECT COUNT(*) AS n FROM geo_targets WHERE enabled = 1`)
     .first<{ n: number }>();
   let dispatched = 0;
-  for (const dataset of ['overture', 'fsq'] as const) {
+  for (const dataset of ['overture_places', 'fsq_places'] as const) {
     await enqueue(env.DB, {
       jobType: 'dataset_import',
       targetType: dataset,
@@ -431,9 +440,26 @@ async function datasetImport(env: Env): Promise<{ dispatched: number; note?: str
   return { dispatched, note: `${dispatched} import jobs enqueued for the GitHub Actions runner` };
 }
 
-/** Weekly backup: recorded here, executed by wrangler in CI. */
+/**
+ * Weekly backup: recorded here, executed by wrangler in CI.
+ *
+ * The payload now declares `runner: 'gha'`, which it did not. Without it the job
+ * claimed itself as worker work, went to the router, and found no
+ * `provider_capability` row for a target type called `backup` — because `backup`
+ * is not one of the forty-five target types at all, it is maintenance. So it was
+ * parked as `needs_manual` once a week, forever.
+ *
+ * Declaring the runner is the honest fix rather than inventing a target type:
+ * a dump of D1 is not a data source, and giving it a capability row would have
+ * put a sixth entry in Wave 0 and quietly broken "Wave 0 = five".
+ */
 async function weeklyBackup(env: Env): Promise<{ dispatched: number; note?: string }> {
-  const jobId = await enqueue(env.DB, { jobType: 'dataset_import', targetType: 'backup', payload: { kind: 'd1_dump' }, priority: 1 });
+  const jobId = await enqueue(env.DB, {
+    jobType: 'dataset_import',
+    targetType: 'backup',
+    payload: { kind: 'd1_dump', runner: 'gha' },
+    priority: 1,
+  });
   await env.DB.prepare(
     `INSERT INTO backup_log (id, kind, status, created_at) VALUES (?, 'd1_dump', 'requested', unixepoch())`,
   )
