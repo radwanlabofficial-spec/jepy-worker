@@ -1,0 +1,53 @@
+-- 0003_drop_dead_lead_indexes.sql — drop four indexes nothing reads. ADR-043.
+--
+-- Why this exists: D1's free tier allows 100,000 rows WRITTEN per day, and an
+-- INSERT into `leads` is not one row written. SQLite maintains every index on the
+-- table inside the same statement and D1 bills each index entry as a row, so the
+-- cost of one lead is (1 + number of indexes on `leads`). `leads` carried ten
+-- explicit indexes plus the automatic index behind its TEXT PRIMARY KEY — twelve
+-- rows written per lead. The Austin pilot import (8,126 leads) therefore spent
+-- ~97,500 of the 100,000 daily budget: 97.5% of a day for one metro.
+--
+-- Four of those ten indexes have no reader. Each was checked against every SQL
+-- string in src/ before it was dropped; the per-index evidence is in ADR-043.
+--
+-- The mechanism that made three of them redundant is deliberate and already
+-- built: the R8 dedup cascade is COMPUTED, not queried tier by tier. dedupKey()
+-- in src/routes/imports.ts picks one tier (valid non-shared phone → overture_id /
+-- fsq_id → email → domain → name_slug) and writes the winner into `dedup_key`,
+-- which is the only lead column with a lookup index. `overture_id`, `fsq_id` and
+-- `domain` are written by the import path and read back by nothing.
+--
+--   dropped            why nothing reads it
+--   ----------------   -------------------------------------------------------
+--   idx_leads_fsq      fsq_id is written (imports.ts) and used as a dedup TIER in
+--                      application code; no WHERE/JOIN/ORDER BY names the column.
+--   idx_leads_overture same, for overture_id.
+--   idx_leads_domain   domain appears in one query, `domain LIKE '%q%'` (the
+--                      leads search box), and a leading wildcard cannot use an
+--                      index anyway. The import path reads it from the job
+--                      payload, not from `leads`.
+--   idx_leads_capture  capture_batch_id is never written AND never read: the
+--                      column is absent from the import INSERT list and from
+--                      every query in src/. Mode B capture (STEP 15b) will write
+--                      it; add the index back then, when there is a reader.
+--
+-- Kept, each named with the reader that needs it:
+--
+--   idx_leads_dedup_key       UNIQUE — the dedup cascade's single lookup (R8)
+--   idx_leads_phone           — STEP 9 computes phone_usage_count grouped by
+--                               phone_e164; without it that is a scan per phone
+--   idx_leads_tier_score      — /api/leads?tier= and ORDER BY final_score DESC
+--   idx_leads_city_niche      — /api/leads?city= and ?niche=
+--   idx_leads_status_updated  — /api/leads?status= and ORDER BY updated_at DESC
+--   idx_leads_stage           — /api/leads?stage=
+--
+-- Effect: twelve rows written per lead become eight, -33%. Nothing is lost on the
+-- read path. Reversing any single drop is one CREATE INDEX on a table that holds
+-- 8,126 rows today, so this is cheap to undo — but it is undone by a NEW
+-- migration, never by editing this file (ADR-028).
+
+DROP INDEX IF EXISTS idx_leads_fsq;
+DROP INDEX IF EXISTS idx_leads_capture_batch;
+DROP INDEX IF EXISTS idx_leads_overture;
+DROP INDEX IF EXISTS idx_leads_domain;
