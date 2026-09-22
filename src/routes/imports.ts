@@ -39,6 +39,8 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { fail, ok } from '../lib/envelope';
 import { requireAdmin } from '../middleware/auth';
+import { dedupKey, slugify } from '../lib/dedup';
+import { NORMALISER, normalisePhone } from '../lib/phone';
 import type { Actor, Env } from '../env';
 
 /** Rows per call. Bounds the request body, the D1 batch and the R2 object. */
@@ -59,56 +61,14 @@ function stageKey(env: Env, importId: string, chunkIndex: number): string {
   return `${prefix}wave0/${importId}/chunk-${String(chunkIndex).padStart(5, '0')}.ndjson`;
 }
 
-/**
- * A slug good enough to compare two business names, and no better.
- *
- * This is not the normaliser STEP 9 builds. It exists only so the third step of
- * the dedup cascade has something stable to compare, and it is intentionally
- * conservative: lowercase, strip accents and punctuation, collapse whitespace.
- * Anything cleverer here would silently merge two legitimately different
- * businesses, and the merge is not reversible from the surviving row.
- */
-function slugify(value: string): string {
-  return value
-    .normalize('NFKD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 80);
-}
-
-/**
- * Digits for comparison, with a US country code when the shape is unmistakably
- * North American. STEP 9 replaces this with libphonenumber-js and the full
- * cascade; until then the honest statement is that this catches the common case
- * and nothing else, which is still better than deduplicating on nothing.
- */
-function phoneKey(raw: string | null | undefined): string | null {
-  if (!raw) return null;
-  const digits = raw.replace(/\D/g, '');
-  if (digits.length === 10) return `+1${digits}`;
-  if (digits.length === 11 && digits.startsWith('1')) return `+${digits}`;
-  if (digits.length >= 8) return `+${digits}`;
-  return null;
-}
-
-/**
- * The dedup cascade, in the order 05-schema.md gives it, restricted to the
- * fields a Tier 0 dump actually carries: phone, then the source's own id, then
- * name+city. Email and domain come later, when enrichment has fetched them.
- *
- * The prefix is part of the key on purpose. Two different businesses can share a
- * slug, and a slug that collides with a phone number would be a merge nobody
- * could explain afterwards.
- */
-function dedupKey(row: { phone?: string | null; overture_id?: string | null; fsq_id?: string | null; name: string; city?: string | null }): string {
-  const phone = phoneKey(row.phone);
-  if (phone) return `p:${phone}`;
-  if (row.overture_id) return `o:${row.overture_id}`;
-  if (row.fsq_id) return `f:${row.fsq_id}`;
-  return `n:${slugify(row.name)}|${slugify(row.city ?? '')}`;
-}
+// `slugify` and `dedupKey` moved to `lib/dedup.ts` in STEP 9, and the phone tier
+// inside the cascade moved to `lib/phone.ts`. They live there now because this is
+// no longer the only door leads come through: the backfill, the console and Mode B
+// capture have to answer "have I seen this business before" the same way, and R16
+// makes one ingest path the rule rather than a preference. The old `phoneKey()`
+// that stood here — ten digits means "prefix +1" — was measured against the
+// library on all 7,353 stored numbers and agreed with it on every one, which is
+// why this swap changes no existing `dedup_key`.
 
 const rowSchema = z.object({
   name: z.string().min(1).max(300),
@@ -257,15 +217,34 @@ importRoutes.post('/admin/import/chunk', async (c) => {
 
   const now = Math.floor(Date.now() / 1000);
   const statements = input.rows.map((row) => {
+    // Normalised at INSERT time by the same function the backfill and the capture
+    // path call (R16). A row from a Tier 0 dump and the same business arriving
+    // through the console therefore cannot end up holding two different numbers,
+    // and no second backfill is ever needed for rows that arrive from here on.
+    const phone = normalisePhone(row.phone, row.country_code);
+
+    const fields: Record<string, string> = Object.fromEntries(
+      Object.entries(row)
+        .filter(([, value]) => value !== null && value !== undefined && value !== '')
+        .map(([field]) => [field, ledger.dataset]),
+    );
+    // A derived column names the NORMALISER, not the dataset. R7's provenance is
+    // only worth keeping if a derived value does not claim to be source data.
+    // `valid === null` means there was nothing to normalise, and recording a
+    // source for a value that was never produced is a lie the row carries
+    // forever — so the four keys appear only when a parse actually happened.
+    if (phone.valid !== null) {
+      fields.phone_e164 = NORMALISER;
+      fields.phone_country = NORMALISER;
+      fields.phone_type = NORMALISER;
+      fields.phone_valid = NORMALISER;
+    }
+
     const provenance = JSON.stringify({
       dataset: ledger.dataset,
       release: ledger.release_version,
       raw_ref_r2: key,
-      fields: Object.fromEntries(
-        Object.entries(row)
-          .filter(([, value]) => value !== null && value !== undefined && value !== '')
-          .map(([field]) => [field, ledger.dataset]),
-      ),
+      fields,
     });
 
     return c.env.DB.prepare(
@@ -276,8 +255,9 @@ importRoutes.post('/admin/import/chunk', async (c) => {
       `INSERT OR IGNORE INTO leads
          (id, name, name_slug, domain, website_url, phone_raw, address_line, city, region, postal_code,
           country_code, lat, lng, category, niche, overture_id, fsq_id, dedup_key,
+          phone_e164, phone_country, phone_type, phone_valid,
           status, stage, captured_by, source_url, lawful_basis, provenance_json, first_seen_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', 'new', 'dataset', ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', 'new', 'dataset', ?, ?, ?, ?)`,
     ).bind(
       crypto.randomUUID(),
       row.name,
@@ -297,6 +277,10 @@ importRoutes.post('/admin/import/chunk', async (c) => {
       row.overture_id ?? null,
       row.fsq_id ?? null,
       dedupKey(row),
+      phone.e164,
+      phone.country,
+      phone.type,
+      phone.valid,
       row.website_url ?? null,
       // Overture Places is ODbL. Storing it is redistribution-neutral; EXPORTING
       // it is the open licensing question the plan still has to settle, so this
