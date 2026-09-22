@@ -218,15 +218,42 @@ normaliseRoutes.post('/admin/normalise/chunk', async (c) => {
  * property of the rule.
  */
 normaliseRoutes.post('/admin/normalise/shared', async (c) => {
-  const result = await c.env.DB.prepare(
-    `UPDATE leads
-        SET phone_usage_count = (SELECT COUNT(*) FROM leads l2 WHERE l2.phone_e164 = leads.phone_e164),
-            is_shared_phone   = CASE
-              WHEN (SELECT COUNT(*) FROM leads l2 WHERE l2.phone_e164 = leads.phone_e164) > 2 THEN 1 ELSE 0 END
-      WHERE phone_e164 IS NOT NULL AND is_manual_edited = 0`,
-  ).run();
+  // TWO guarded statements rather than one unguarded one, because one statement
+  // was measured telling a lie. Written without a comparison it matched every
+  // row with a phone on every call, and the second production run reported
+  // `rows_written: 7353` for a pass that changed nothing — 7.4% of the day's
+  // write allowance spent to arrive at the answer that was already there.
+  //
+  // The guard is `IS NOT` rather than `!=` on purpose: `!=` is NULL-unsafe, so a
+  // row whose count has never been set would compare as unknown and be skipped
+  // forever instead of being filled in.
+  //
+  // Split in two so the flag reads the count the first statement just wrote,
+  // rather than each statement re-deriving the count for itself.
+  const results = await c.env.DB.batch([
+    c.env.DB.prepare(
+      `UPDATE leads
+          SET phone_usage_count = (SELECT COUNT(*) FROM leads l2 WHERE l2.phone_e164 = leads.phone_e164)
+        WHERE phone_e164 IS NOT NULL
+          AND is_manual_edited = 0
+          AND phone_usage_count IS NOT (SELECT COUNT(*) FROM leads l2 WHERE l2.phone_e164 = leads.phone_e164)`,
+    ),
+    c.env.DB.prepare(
+      `UPDATE leads
+          SET is_shared_phone = CASE WHEN phone_usage_count > 2 THEN 1 ELSE 0 END
+        WHERE phone_e164 IS NOT NULL
+          AND is_manual_edited = 0
+          AND is_shared_phone IS NOT (CASE WHEN phone_usage_count > 2 THEN 1 ELSE 0 END)`,
+    ),
+  ]);
 
-  return c.json(ok({ rows_written: result.meta.changes ?? 0 }));
+  return c.json(
+    ok({
+      usage_count_written: results[0]?.meta.changes ?? 0,
+      shared_flag_written: results[1]?.meta.changes ?? 0,
+      rows_written: (results[0]?.meta.changes ?? 0) + (results[1]?.meta.changes ?? 0),
+    }),
+  );
 });
 
 /**
