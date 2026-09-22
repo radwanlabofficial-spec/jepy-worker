@@ -1,0 +1,89 @@
+# STEP 9 — normalise the phone numbers already in `leads`.
+#
+# WHY THIS RUNS IN ACTIONS AND NOT FROM A LAPTOP. `/api/admin/*` is guarded by
+# `ADMIN_SECRET`, and Cloudflare never returns a Worker secret once it is set —
+# it is write-only. The one place that value is known to authenticate is this
+# repository's own Actions secret, which the Wave 0 import already uses. So the
+# driver runs where the credential already lives, and nobody has to move it into
+# a chat window, a shell history or a file to get one job done.
+#
+# The Worker does the work. This job only walks a cursor through
+# `/api/admin/normalise/chunk`; the normaliser, the cascade and every write stay
+# in `src/`, so there is one implementation rather than one per runner (R16).
+#
+# SAFE TO RE-RUN. Every chunk compares before it writes and skips a row that is
+# already correct, so an interrupted run is resumed by dispatching this again and
+# the finished chunks cost nothing. That also means a second dispatch is the
+# cheapest way to prove the first one stuck.
+name: step9-backfill
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "which Worker to normalise against"
+        type: choice
+        options: [production, preview]
+        default: production
+      limit:
+        description: "rows per call (the Worker caps at 500)"
+        type: string
+        default: "500"
+      max_calls:
+        description: "safety stop on the number of calls"
+        type: string
+        default: "200"
+
+# One at a time. Two overlapping walks would not corrupt anything — the writes are
+# idempotent — but each would report half the totals, and a half-counted backfill
+# is a report nobody can act on.
+concurrency:
+  group: step9-backfill
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve the Worker URL
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.target }}" = "preview" ]; then
+            echo "WORKER_URL=https://jepy-worker-preview.radwanlab-official.workers.dev" >> "$GITHUB_ENV"
+          else
+            echo "WORKER_URL=${{ vars.WORKER_URL || 'https://jepy-worker.radwanlab-official.workers.dev' }}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Run the backfill
+        run: |
+          set -euo pipefail
+          # The driver exits non-zero when the secret is absent or a call is
+          # refused, so a broken credential fails HERE rather than being read as
+          # "no rows needed normalising".
+          python3 scripts/run_backfill.py \
+            --url "${WORKER_URL}" \
+            --limit "${{ inputs.limit }}" \
+            --max-calls "${{ inputs.max_calls }}"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### step9-backfill (${{ inputs.target }})"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| target | \`${{ inputs.target }}\` |"
+            echo "| worker | \`${WORKER_URL}\` |"
+            echo "| limit | \`${{ inputs.limit }}\` |"
+            echo "| max calls | \`${{ inputs.max_calls }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
