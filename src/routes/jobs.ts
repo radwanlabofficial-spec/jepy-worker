@@ -7,11 +7,14 @@
  */
 
 import { Hono } from 'hono';
+import type { Handler } from 'hono';
 import { ok, type ApiMeta } from '../lib/envelope';
 import { decodeCursor, encodeCursor, intParam, readPage } from '../lib/http';
 import type { Actor, Env } from '../env';
 
 export const jobRoutes = new Hono<{ Bindings: Env; Variables: { actor: Actor } }>();
+
+type AppEnv = { Bindings: Env; Variables: { actor: Actor } };
 
 jobRoutes.get('/jobs/meta', async (c) => {
   const [live, dead, circuits, byType] = await c.env.DB.batch<Record<string, unknown>>([
@@ -107,8 +110,14 @@ jobRoutes.get('/jobs', async (c) => {
  * The hop trail: the only way to reconstruct why a provider was chosen, which
  * candidate each hard filter dropped, and which pack version ran. `score_milli`
  * is returned as an integer to avoid a float crossing the wire.
+ *
+ * ONE handler, two paths (`/hops` and `/attempts`). The console's Jobs drawer
+ * calls `/attempts` while the contract documents `/hops`; both name the same
+ * `route_attempts` rows, so they are served by the same function rather than a
+ * copy that can drift. A second copy is how the two views would silently start
+ * disagreeing about a job.
  */
-jobRoutes.get('/jobs/:id/hops', async (c) => {
+const listJobAttempts: Handler<AppEnv> = async (c) => {
   const jobId = c.req.param('id');
   const [job, hops, rejected] = await c.env.DB.batch<Record<string, unknown>>([
     c.env.DB.prepare(
@@ -170,4 +179,7 @@ jobRoutes.get('/jobs/:id/hops', async (c) => {
         'Only circuit-open and capability-disabled candidates can be reconstructed; per-candidate filter drops are not persisted.',
     }),
   );
-});
+};
+
+jobRoutes.get('/jobs/:id/hops', listJobAttempts);
+jobRoutes.get('/jobs/:id/attempts', listJobAttempts);

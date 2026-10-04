@@ -24,6 +24,7 @@
  */
 
 import { Hono } from 'hono';
+import type { Handler } from 'hono';
 import { z } from 'zod';
 import { fail, ok } from '../lib/envelope';
 import { requireAdmin } from '../middleware/auth';
@@ -34,6 +35,8 @@ import { claim, complete, fail as failJob } from '../lib/queue';
 import type { Actor, Env } from '../env';
 
 export const deviceRoutes = new Hono<{ Bindings: Env; Variables: { actor: Actor; device: DeviceRow } }>();
+
+type AppEnv = { Bindings: Env; Variables: { actor: Actor } };
 
 /** Mode A opens one tab at a time, so a batch would only be queued client-side. */
 const PENDING_DEFAULT = 1;
@@ -264,8 +267,19 @@ deviceRoutes.post('/admin/devices', async (c) => {
   );
 });
 
-/** The kill switch. `revoke` also closes the device permanently. */
-deviceRoutes.post('/admin/devices/:id/directive', async (c) => {
+/**
+ * The kill switch. `revoke` also closes the device permanently.
+ *
+ * ONE handler, two paths, and they are NOT the same door. The `/admin/` form is
+ * for cron and GitHub Actions and is wrapped in `requireAdmin` above, so a human
+ * console session is refused it. The console's Devices page needs the same
+ * action with a human Access identity, which is why `/api/devices/:id/directive`
+ * exists as a second mount of this exact function rather than a copy — the
+ * update it performs is identical, and only the guard in front of it differs.
+ * A copy is how a later fix to the update (say, auditing the directive) lands on
+ * one path and not the other.
+ */
+const setDirective: Handler<AppEnv> = async (c) => {
   const parsed = directiveSchema.safeParse(await c.req.json().catch(() => ({})));
   if (!parsed.success) {
     const { body, status } = fail('E_VALIDATION');
@@ -288,7 +302,13 @@ deviceRoutes.post('/admin/devices/:id/directive', async (c) => {
   }
 
   return c.json(ok({ id: c.req.param('id'), directive, landed: 'next poll' }));
-});
+};
+
+deviceRoutes.post('/admin/devices/:id/directive', setDirective);
+// Human path for the console. Deliberately NOT added to the device scope in
+// middleware/device.ts: this is an operator action, not something the extension
+// token may reach.
+deviceRoutes.post('/devices/:id/directive', setDirective);
 
 /** A payload that will not parse is passed through as null rather than thrown on. */
 function safeParse(raw: string): unknown {

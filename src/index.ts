@@ -33,6 +33,7 @@ import { importRoutes } from './routes/imports';
 import { normaliseRoutes } from './routes/normalise';
 import { runnerRoutes } from './routes/runners';
 import { deviceRoutes } from './routes/device';
+import { pipelineRoutes } from './routes/pipeline';
 import { CRONS, TRIGGERS, runScheduled, runTick } from './jobs/scheduled';
 import { cancel, enqueue, retry } from './lib/queue';
 import { z } from 'zod';
@@ -115,6 +116,7 @@ app.route('/api', importRoutes);
 app.route('/api', normaliseRoutes);
 app.route('/api', runnerRoutes);
 app.route('/api', deviceRoutes);
+app.route('/api', pipelineRoutes);
 
 app.notFound((c) => {
   const { body, status } = fail('E_NOT_FOUND');
@@ -189,6 +191,28 @@ app.post('/api/jobs/:id/cancel', async (c) => {
 });
 
 /**
+ * The most recent `cron_runs` row a just-finished run recorded, read back so an
+ * on-demand trigger can answer with the outcome rather than only an ack.
+ *
+ * Shared by run-cron and the manual backup trigger because they answer in the
+ * same shape: two callers, one query. The name a run was recorded under comes
+ * from the scheduler itself, so it is passed in rather than derived from a cron
+ * expression — those are not the same string, and assuming otherwise is how the
+ * earlier version of this endpoint read back nothing at all.
+ */
+function recentRun(env: Env, names: string[]) {
+  return env.DB.prepare(
+    `SELECT cron_name, status, error_text, jobs_dispatched, finished_at
+       FROM cron_runs
+      WHERE cron_name IN (${names.map(() => '?').join(', ')}) AND started_at >= ?
+      ORDER BY started_at DESC, finished_at DESC
+      LIMIT 1`,
+  )
+    .bind(...names, Math.floor(Date.now() / 1000) - 300)
+    .first();
+}
+
+/**
  * Manual trigger for one scheduled job. Cloudflare offers no way to fire a cron
  * on demand, and "wait until Monday 05:00 to see whether it works" is not a
  * verification strategy. It is also what the console's backup button calls.
@@ -220,17 +244,30 @@ app.post('/api/admin/run-cron', async (c) => {
   // so the endpoint never has to guess it from the expression.
   const cronName = names.join(',');
 
-  const last = await c.env.DB.prepare(
-    `SELECT cron_name, status, error_text, jobs_dispatched, finished_at
-       FROM cron_runs
-      WHERE cron_name IN (${names.map(() => '?').join(', ')}) AND started_at >= ?
-      ORDER BY started_at DESC, finished_at DESC
-      LIMIT 1`,
-  )
-    .bind(...names, Math.floor(Date.now() / 1000) - 300)
-    .first();
+  const last = await recentRun(c.env, names);
 
   return c.json(ok({ cron: parsed.data.cron, cron_name: cronName, ran: names, last }));
+});
+
+/**
+ * Manual backup — `POST /api/admin/backup`.
+ *
+ * The weekly vault/D1 backup is one scheduled job (`weekly_backup`), and
+ * "wait until Saturday 20:00 to find out whether it works" is exactly the
+ * verification problem run-cron was built to solve. So the console's backup
+ * button runs that one job on demand. It answers in run-cron's shape — same
+ * keys, same `cron_runs` source — so the two buttons parse one result, and the
+ * answer names the job it ran rather than echoing a cron expression.
+ *
+ * It does NOT export the vault here: `weeklyBackup` enqueues the GHA job and
+ * records the request. The dump itself needs wrangler and R2, which this Worker
+ * does not have (that is the design, not a stub).
+ */
+app.post('/api/admin/backup', async (c) => {
+  const names = [await runScheduled(CRONS.weeklyBackup, c.env)];
+  return c.json(
+    ok({ cron: CRONS.weeklyBackup, cron_name: names.join(','), ran: names, last: await recentRun(c.env, names) }),
+  );
 });
 
 app.get('/api/admin/cron-runs', async (c) => {

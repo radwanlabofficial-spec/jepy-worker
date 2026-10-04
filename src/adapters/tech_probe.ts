@@ -33,6 +33,19 @@
  *                   number of examples behind it; it never synthesises an address.
  *   psi             Google PageSpeed Insights, which is keyless. A failed score
  *                   is still a signal.
+ *   wayback         The last time the Internet Archive saw this URL, returned as an
+ *                   age in days. The only credential-free way to answer "how stale
+ *                   is this site", and 12-scoring.md §2.1 spends 8 of its 100
+ *                   points on exactly that question.
+ *   website_meta    Whether the homepage publishes a contact route. §2.2 scores it
+ *                   at 4 points under a name (`website_meta`) that described no
+ *                   probe at all until this one existed.
+ *
+ * A NEW KIND IS NOT A NEW ADAPTER. Adding `wayback` and `website_meta` leaves the
+ * adapter count at six (07-targets.md §2), because a probe kind is a TRANSPORT
+ * choice behind an endpoint, exactly like choosing `api_json` over `serp_query`.
+ * The rule this file must never break is the one about site knowledge: nothing
+ * here may learn a domain name.
  */
 
 import type { Adapter } from './shared';
@@ -44,7 +57,16 @@ import {
 } from './shared';
 import type { AdapterOutcome } from '../router/types';
 
-const PROBE_KINDS = ['dns_mx', 'ssl_cert', 'tech_stack', 'robots_sitemap', 'email_pattern', 'psi'] as const;
+const PROBE_KINDS = [
+  'dns_mx',
+  'ssl_cert',
+  'tech_stack',
+  'robots_sitemap',
+  'email_pattern',
+  'psi',
+  'wayback',
+  'website_meta',
+] as const;
 type ProbeKind = (typeof PROBE_KINDS)[number];
 
 function isProbeKind(value: unknown): value is ProbeKind {
@@ -120,6 +142,10 @@ export const techProbeAdapter: Adapter = {
           return await probeEmail(invocation, parsed, deadline, started);
         case 'psi':
           return await probePsi(invocation, parsed, deadline, started);
+        case 'wayback':
+          return await probeWayback(invocation, parsed, deadline, started);
+        case 'website_meta':
+          return await probeWebsiteMeta(invocation, parsed, deadline, started);
       }
     } catch (error) {
       const name = error instanceof Error ? error.name : 'UnknownError';
@@ -245,6 +271,19 @@ async function probeStack(
   if (/squarespace/i.test(body)) markers.push('squarespace');
   if (/wix\.com|wixstatic/i.test(body)) markers.push('wix');
   if (markers.length === 0 && generator) markers.push(generator.toLowerCase());
+
+  // 12-scoring.md §2.1 adds 20 points when the site measures nothing at all:
+  // no analytics means nobody is looking at whether the site works, which is a
+  // different fact from which CMS built it. One home-page fetch is already paid
+  // for here, so this costs nothing extra. Emitted as a marker rather than a
+  // field so `tech_stack` stays a single string the scorer parses once.
+  const ANALYTICS = [
+    /googletagmanager\.com|gtag\(/i,
+    /google-analytics\.com|ga\('create'/i,
+    /connect\.facebook\.net|fbq\(/i,
+    /matomo|plausible\.io|umami|clarity\.ms|hotjar/i,
+  ];
+  if (!ANALYTICS.some((pattern) => pattern.test(body))) markers.push('no_analytics');
 
   return buildOutcome(invocation, {
     records: [
@@ -409,6 +448,152 @@ async function probePsi(
         // The plan's own words: a FAILED score is still a signal.
         score: numeric,
         field_category: body.loadingExperience?.overall_category ?? null,
+      },
+    ],
+    outcome: 'success',
+    http_status: response.status,
+    latency_ms: latency,
+    units: 1,
+  });
+}
+
+/**
+ * How long since the Internet Archive last captured this site.
+ *
+ * The value is an AGE IN DAYS, not a timestamp, because that is what the scorer
+ * needs and because it keeps the comparison in one place: `pass0.ts` bands it at
+ * one year and three, and a timestamp would make every consumer re-derive the
+ * same subtraction against a different clock.
+ *
+ * A SITE WITH NO SNAPSHOT IS NOT A STALE SITE. The record says
+ * `snapshot_found: 0` and leaves `age_days` null, which the scorer reads as "not
+ * collected" rather than "ancient" — the same distinction 12-scoring.md §2.5
+ * draws everywhere else. Concluding staleness from an absent snapshot would score
+ * every brand-new domain as neglected, which is the opposite of the truth.
+ */
+async function probeWayback(
+  invocation: Invocation,
+  host: { host: string; origin: string },
+  deadline: number,
+  started: number,
+): Promise<AdapterOutcome> {
+  const url = `https://archive.org/wayback/available?url=${encodeURIComponent(host.host)}`;
+  const response = await fetchWithDeadline(url, { method: 'GET' }, deadline);
+  const latency = Date.now() - started;
+
+  if (!response.ok) {
+    // A 429 here is the archive pacing us, which says nothing about the site.
+    const { outcome, error_code } = classifyHttp(response.status);
+    return buildOutcome(invocation, {
+      outcome,
+      error_code,
+      http_status: response.status,
+      latency_ms: latency,
+      units: 1,
+    });
+  }
+
+  const body = (await response.json()) as {
+    archived_snapshots?: {
+      closest?: { available?: boolean; url?: string; timestamp?: string; status?: string };
+    };
+  };
+
+  const closest = body.archived_snapshots?.closest;
+  const timestamp = closest?.timestamp ?? null;
+  let ageDays: number | null = null;
+
+  if (closest?.available === true && timestamp && /^\d{14}$/.test(timestamp)) {
+    const captured = Date.UTC(
+      Number(timestamp.slice(0, 4)),
+      Number(timestamp.slice(4, 6)) - 1,
+      Number(timestamp.slice(6, 8)),
+      Number(timestamp.slice(8, 10)),
+      Number(timestamp.slice(10, 12)),
+      Number(timestamp.slice(12, 14)),
+    );
+    ageDays = Math.max(0, Math.floor((Date.now() - captured) / 86_400_000));
+  }
+
+  return buildOutcome(invocation, {
+    records: [
+      {
+        domain: host.host,
+        snapshot_found: closest?.available === true ? 1 : 0,
+        last_capture: timestamp,
+        age_days: ageDays,
+        snapshot_url: closest?.url ?? null,
+      },
+    ],
+    outcome: 'success',
+    http_status: response.status,
+    latency_ms: latency,
+    units: 1,
+  });
+}
+
+/**
+ * Does the site publish a way to be contacted?
+ *
+ * This is 12-scoring.md §2.2's `website_meta`, worth 4 of the 100 points, and it
+ * is the cheapest of the Reachability signals: it is the same home-page fetch the
+ * other probes already make.
+ *
+ * WHAT IT MATCHES is deliberately a list of PATH TOKENS across the common
+ * languages of the markets in scope, not selectors for particular sites. R23
+ * forbids this file learning a domain, and classifying an href by its own text is
+ * not that — the same reasoning that lets `tech_stack` recognise a WordPress site
+ * from its own markup rather than from a hard-coded URL.
+ */
+async function probeWebsiteMeta(
+  invocation: Invocation,
+  host: { host: string; origin: string },
+  deadline: number,
+  started: number,
+): Promise<AdapterOutcome> {
+  const response = await fetchWithDeadline(host.origin, { method: 'GET' }, deadline);
+  const body = await response.text();
+  const latency = Date.now() - started;
+
+  if (!response.ok) {
+    const { outcome, error_code } = classifyHttp(response.status);
+    return buildOutcome(invocation, {
+      outcome,
+      error_code,
+      http_status: response.status,
+      latency_ms: latency,
+      units: 1,
+    });
+  }
+
+  const CONTACT_TOKENS = [
+    'contact', 'contact-us', 'contactus', 'get-in-touch', 'reach-us',
+    'kontakt', 'contacto', 'contactez', 'contato', 'iletisim',
+    'about', 'impressum', 'support',
+  ];
+
+  const hrefs = [...body.matchAll(/<a\b[^>]*href=["']([^"']+)["']/gi)].map((match) => match[1] ?? '');
+  const mailtoCount = hrefs.filter((href) => href.toLowerCase().startsWith('mailto:')).length;
+  const telCount = hrefs.filter((href) => href.toLowerCase().startsWith('tel:')).length;
+
+  const contactHref =
+    hrefs.find((href) => {
+      const lower = href.toLowerCase();
+      if (lower.startsWith('mailto:') || lower.startsWith('tel:')) return false;
+      return CONTACT_TOKENS.some((token) => lower.includes(token));
+    }) ?? null;
+
+  return buildOutcome(invocation, {
+    records: [
+      {
+        domain: host.host,
+        // The scorer reads `contact_href` first and falls back to the counts: a
+        // linked contact page is a deliberate choice, a bare mailto could be
+        // anything, and 12-scoring.md gives one band for the feature.
+        contact_href: contactHref,
+        mailto_count: mailtoCount,
+        tel_count: telCount,
+        html_bytes: body.length,
       },
     ],
     outcome: 'success',

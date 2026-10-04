@@ -62,6 +62,7 @@ export async function claimAccount(
   db: D1Database,
   provider: string,
   now = Math.floor(Date.now() / 1000),
+  requireCredential = false,
 ): Promise<ClaimedAccount | null> {
   const maxConcurrency = MAX_CONCURRENCY[provider] ?? null;
 
@@ -94,12 +95,17 @@ export async function claimAccount(
                       AND ra.account_label = candidate.account_label
                       AND ra.outcome IS NULL
                  ) < ?3)
+             AND (?4 = 0 OR EXISTS (
+                   SELECT 1 FROM provider_credentials AS credential
+                    WHERE credential.account_id = candidate.id
+                      AND credential.test_status = 'ok'
+                 ))
            ORDER BY candidate.last_used_at ASC, candidate.priority ASC, candidate.account_label ASC
            LIMIT 1
         )
         RETURNING id, account_label, provider, quota_used, quota_limit, daily_used, daily_limit`,
     )
-    .bind(now, provider, maxConcurrency)
+    .bind(now, provider, maxConcurrency, requireCredential ? 1 : 0)
     .first<ClaimedAccount>();
 
   return row ?? null;

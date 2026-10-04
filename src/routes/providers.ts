@@ -13,9 +13,15 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { fail, ok } from '../lib/envelope';
 import { intParam } from '../lib/http';
+import { auditLog } from './misc';
 import type { Actor, Env } from '../env';
 
 export const providerRoutes = new Hono<{ Bindings: Env; Variables: { actor: Actor } }>();
+
+/** Escapes a provider name so it can be used literally inside the label pattern. */
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
 
 // `/next-label` is registered before `/accounts/:id` would matter, but they use
 // different methods so there is no shadowing here.
@@ -63,6 +69,59 @@ providerRoutes.post('/providers/accounts', async (c) => {
   }
   const input = parsed.data;
 
+  // R22. `bd` is the BANGLADESH country prefix, never a provider. The value this
+  // system actually uses is always `brightdata`, but the guard is here because a
+  // row named `bd_...` would read to any later reader — human or model — as a
+  // geo filter, and a wrong geo filter silently produces the wrong dataset.
+  // Refused without a `detail.reason`: 11-api-contract.md §12 records this as a
+  // bare E_VALIDATION.
+  if (/^bd/i.test(input.provider)) {
+    const { body, status } = fail('E_VALIDATION', { provider: input.provider });
+    return c.json(body, status as 400);
+  }
+
+  // ADR-034. The pool grows from the dashboard, so the label is the one stable
+  // identity a row keeps across `brightdata_credit_log` and `route_attempts`; it
+  // must be `<provider>-<NN>`. A free-form label lets two rows collide in the
+  // `/next-label` allocator and makes the pool unreadable after the fact.
+  const labelPattern = new RegExp(`^${escapeRegExp(input.provider)}-\\d{2}$`);
+  if (!labelPattern.test(input.account_label)) {
+    const { body, status } = fail('E_VALIDATION', { reason: 'label_format', account_label: input.account_label });
+    return c.json(body, status as 400);
+  }
+
+  // R21. Exactly one Yelp account, forever — a second is a terms problem, not a
+  // quota problem, and ADR-034 makes the refusal permanent rather than
+  // threshold-based. ADR-034 and 19-errors.md §4 assign this E_FORBIDDEN with
+  // `yelp_single_account`: the request is well formed, it is simply not
+  // permitted, which is what E_FORBIDDEN means.
+  if (input.provider === 'yelp') {
+    const existingYelp = await c.env.DB.prepare(
+      `SELECT id FROM provider_accounts WHERE provider = 'yelp' LIMIT 1`,
+    ).first<{ id: string }>();
+    if (existingYelp) {
+      const { body, status } = fail('E_FORBIDDEN', { reason: 'yelp_single_account' });
+      return c.json(body, status as 403);
+    }
+  }
+
+  // A PAID provider may not be registered with a zero ceiling. `cost_micro_per_unit`
+  // is what marks a provider as charging: if any of its capability rows carries a
+  // non-zero unit cost, then a `quota_limit` of 0 is not "unlimited" — it is the
+  // budget guard multiplied by a zero cost, which is a guard that can never fire
+  // (R11's spirit, 11-api-contract.md §4.1 `quota_zero`). Keyless/free providers
+  // keep the null they have; only a paid row is refused.
+  const paid = await c.env.DB.prepare(
+    `SELECT 1 AS paid FROM provider_capability
+      WHERE provider = ? AND COALESCE(cost_micro_per_unit, 0) > 0 LIMIT 1`,
+  )
+    .bind(input.provider)
+    .first<{ paid: number }>();
+  if (paid && (input.quota_limit ?? 0) <= 0) {
+    const { body, status } = fail('E_VALIDATION', { reason: 'quota_zero', provider: input.provider });
+    return c.json(body, status as 400);
+  }
+
   const existing = await c.env.DB.prepare(
     `SELECT id FROM provider_accounts WHERE provider = ? AND account_label = ?`,
   )
@@ -94,19 +153,24 @@ providerRoutes.post('/providers/accounts', async (c) => {
     )
     .run();
 
-  // `audit_log.entity_type` is a closed enum of four values and an account is not
-  // one of them, so account changes are recorded against their credentials — the
-  // surface they exist to hold — with the account named in the detail.
-  try {
-    await c.env.DB.prepare(
-      `INSERT INTO audit_log (id, entity_type, entity_id, action, actor_email, result, detail_json, created_at)
-       VALUES (?, 'credential', ?, 'add', ?, 'ok', ?, unixepoch())`,
-    )
-      .bind(crypto.randomUUID(), id, c.get('actor').email, JSON.stringify({ kind: 'provider_account', ...input }))
-      .run();
-  } catch {
-    // ignore
-  }
+  // Recorded AS an account, which it is. Until 0006 widened `audit_log.entity_type`
+  // this was logged as entity_type='credential' with `kind:'provider_account'`
+  // buried in the detail blob, purely because the old CHECK listed only four
+  // entity types. That workaround is gone: it made "who added a provider account"
+  // and "who added a credential" the same question, which is the opposite of why
+  // the table exists. 11-api-contract.md §4.1 names the row precisely —
+  // entity_type='provider_account', action='account_create', entity_id=<label>.
+  await auditLog(c.env, c.get('actor'), {
+    entityType: 'provider_account',
+    entityId: input.account_label,
+    action: 'account_create',
+    detail: {
+      provider: input.provider,
+      quota_limit: input.quota_limit ?? null,
+      quota_window: input.quota_window ?? null,
+      plan_label: input.plan_label ?? null,
+    },
+  });
 
   return c.json(ok({ id, account_label: input.account_label, provider: input.provider }));
 });
@@ -154,16 +218,15 @@ providerRoutes.patch('/providers/accounts/:id', async (c) => {
     )
     .run();
 
-  try {
-    await c.env.DB.prepare(
-      `INSERT INTO audit_log (id, entity_type, entity_id, action, actor_email, result, detail_json, created_at)
-       VALUES (?, 'credential', ?, 'test', ?, 'ok', ?, unixepoch())`,
-    )
-      .bind(crypto.randomUUID(), id, c.get('actor').email, JSON.stringify({ kind: 'provider_account_patch', ...patch }))
-      .run();
-  } catch {
-    // ignore
-  }
+  // Same correction as account creation: an edit to an account is an account
+  // action, recorded as `entity_type='provider_account'` with the new `update`
+  // action, not as a credential `test` with the real intent in a detail blob.
+  await auditLog(c.env, c.get('actor'), {
+    entityType: 'provider_account',
+    entityId: id,
+    action: 'update',
+    detail: { provider: row.provider, account_label: row.account_label, ...patch },
+  });
 
   return c.json(ok({ id, ...patch }));
 });

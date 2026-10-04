@@ -7,11 +7,66 @@
  */
 
 import { Hono } from 'hono';
+import type { Handler } from 'hono';
 import { fail, ok } from '../lib/envelope';
 import { intParam } from '../lib/http';
 import type { Actor, Env } from '../env';
 
 export const miscRoutes = new Hono<{ Bindings: Env; Variables: { actor: Actor } }>();
+
+type AppEnv = { Bindings: Env; Variables: { actor: Actor } };
+
+/**
+ * The one audit writer the other route modules share.
+ *
+ * `routes/vault.ts` keeps its own private helper and should: it hardcodes
+ * `entity_type='credential'`, which is correct for every route in that file.
+ * Directory transport edits, selector-pack transitions, Class C overrides and
+ * provider-account creation are NOT credential changes, and `0006` widened the
+ * `audit_log` enums precisely so each can be recorded under its own
+ * `entity_type` instead of being smuggled in as a credential with a `kind` in
+ * the detail blob. That workaround made "who added a provider account" and "who
+ * added a credential" the same question, which is the opposite of why the table
+ * exists. This is the shared form; the caller names the entity.
+ *
+ * Deliberately swallows its own failure: a lost audit row must never turn a
+ * successful operator action into an error for the operator, and the error path
+ * already records anything that really breaks. `detail` must never carry key
+ * material — the same rule the vault helper follows.
+ */
+export async function auditLog(
+  env: Env,
+  actor: Actor,
+  entry: {
+    entityType: string;
+    entityId: string | null;
+    action: string;
+    result?: string;
+    detail?: Record<string, unknown>;
+  },
+): Promise<string | null> {
+  const id = crypto.randomUUID();
+  try {
+    await env.DB.prepare(
+      `INSERT INTO audit_log (id, entity_type, entity_id, action, actor_email, result, detail_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, unixepoch())`,
+    )
+      .bind(
+        id,
+        entry.entityType,
+        entry.entityId,
+        entry.action,
+        actor.email,
+        entry.result ?? 'ok',
+        entry.detail ? JSON.stringify(entry.detail) : null,
+      )
+      .run();
+    return id;
+  } catch {
+    // ignore
+    return null;
+  }
+}
 
 miscRoutes.get('/audit', async (c) => {
   const url = new URL(c.req.url);
@@ -84,10 +139,18 @@ miscRoutes.get('/settings/niches', async (c) => {
   return c.json(ok((result.results ?? []).map((row) => row.name)));
 });
 
-// The console asks for these under /settings; they were served at /audit and
-// /devices, so both paths exist rather than one being moved and breaking the
-// other caller.
-miscRoutes.get('/settings/errors', async (c) => {
+/**
+ * The error log feed, and the reason this is a named handler rather than an
+ * inline route.
+ *
+ * `11-api-contract.md` §2 and §11 put the same resource at two paths:
+ * `/api/settings/errors` (where the Settings page reads it) and
+ * `/api/admin/errors` (where an operator or a script looks for it). Two paths
+ * over ONE handler, never two copies — the moment they diverge, the console and
+ * the operator stop looking at the same rows, and "the dashboard shows no errors"
+ * stops being evidence of anything.
+ */
+const listErrors: Handler<AppEnv> = async (c) => {
   const url = new URL(c.req.url);
   const limit = Math.min(intParam(url, 'limit') ?? 100, 500);
   const since = intParam(url, 'since');
@@ -109,7 +172,13 @@ miscRoutes.get('/settings/errors', async (c) => {
         .all();
 
   return c.json(ok(result.results ?? []));
-});
+};
+
+// The console asks for these under /settings; they were served at /audit and
+// /devices, so both paths exist rather than one being moved and breaking the
+// other caller.
+miscRoutes.get('/settings/errors', listErrors);
+miscRoutes.get('/admin/errors', listErrors);
 
 miscRoutes.get('/settings/devices', async (c) => {
   const result = await c.env.DB.prepare(
@@ -144,3 +213,34 @@ miscRoutes.get('/settings/router-weights', async (c) => {
     return c.json(body, status as 500);
   }
 });
+
+/**
+ * Mode B capture ingest — CLOSED, and closed on purpose.
+ *
+ * ADR-035 ships Mode B disabled: the operator-driven capture path is not part
+ * of this build, so `/api/captures` exists only to say so. It must answer a
+ * real 403 with `detail.reason='mode_b_disabled'` rather than 404, because the
+ * two are different facts to the console — a 404 reads as "this build is older
+ * than the UI", the 403 reads as "the feature is gated", and only the second
+ * lets the Captures page render its disabled empty state instead of an error.
+ *
+ * WHY THESE PATHS ARE NOT IN THE DEVICE SCOPE. ADR-035 fixes a device token to
+ * three endpoints (jobs/pending, jobs/:id/result, devices/heartbeat) and names
+ * adding `/api/captures` to that scope a forbidden act until the gate is opened.
+ * A token that can only fetch queued work and report it back leaks a nuisance;
+ * a token that can reach a lead-writing door leaks the lead database. The two
+ * routes below therefore sit behind the ordinary human/admin guard — which is
+ * ALSO why they are not a device route and why `DEVICE_SCOPE` is untouched.
+ *
+ * ADR-035's own condition for changing this, verbatim: open Mode B only for a
+ * source_key allowlist — class='C' with an overridable block_reason — with
+ * batches ≤ 25 records, a two-step preview→commit, and `override_reason` of at
+ * least 20 characters. Until all four hold, this handler stays.
+ */
+const modeBDisabled: Handler<AppEnv> = (c) => {
+  const { body, status } = fail('E_FORBIDDEN', { reason: 'mode_b_disabled' });
+  return c.json(body, status as 403);
+};
+
+miscRoutes.get('/captures', modeBDisabled);
+miscRoutes.post('/captures', modeBDisabled);

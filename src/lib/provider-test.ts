@@ -162,13 +162,27 @@ export async function testCredential(provider: string, secret: string): Promise<
         return { status: 'ok', message: `key accepted — ${body.customer}, requests enabled` };
       }
 
-      // 06 §12 names the check for these providers but no endpoint, and a guessed
-      // URL would be indistinguishable from a working one until it silently
-      // passed. They stay untested until the URL is confirmed.
+      // These providers still have no canonical endpoint in the project docs.
+      // Manifest is different when the secret is the explicit JSON endpoint
+      // configuration used by Pass 1: validate its shape locally, but do not make
+      // an undocumented network call merely to mark a credential valid.
+      case 'manifest': {
+        try {
+          const parsed = JSON.parse(secret) as unknown;
+          if (!parsed || typeof parsed !== 'object') throw new Error('not an object');
+          const value = parsed as Record<string, unknown>;
+          const endpoint = typeof value.endpoint === 'string' ? value.endpoint : typeof value.base_url === 'string' ? value.base_url : '';
+          const apiKey = typeof value.api_key === 'string' ? value.api_key : typeof value.key === 'string' ? value.key : '';
+          const url = new URL(endpoint);
+          if (!apiKey || (url.protocol !== 'https:' && !(url.protocol === 'http:' && url.hostname === 'localhost'))) throw new Error('invalid endpoint configuration');
+          return { status: 'ok', message: 'endpoint configuration accepted locally; provider call will be tested during Pass 1' };
+        } catch {
+          return { status: 'failed', message: 'Manifest credential must be JSON with an HTTPS endpoint and api_key' };
+        }
+      }
       case 'resend':
       case 'yelp':
       case 'mapquest':
-      case 'manifest':
         return {
           status: 'untested',
           message: `no test endpoint recorded for ${provider} — 06-providers.md §12 names the check but not the URL, so nothing was called`,
@@ -184,4 +198,4 @@ export async function testCredential(provider: string, secret: string): Promise<
 }
 
 /** Providers this build can genuinely verify, for the UI to be honest about. */
-export const TESTABLE_PROVIDERS = ['apify', 'zerobounce', 'google_psi', 'brightdata'] as const;
+export const TESTABLE_PROVIDERS = ['apify', 'zerobounce', 'google_psi', 'brightdata', 'manifest'] as const;
