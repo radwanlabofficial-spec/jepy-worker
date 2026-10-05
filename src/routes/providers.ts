@@ -325,3 +325,54 @@ providerRoutes.get('/providers/credits/brightdata', async (c) => {
 
   return c.json(ok({ series: result.results ?? [] }));
 });
+
+/**
+ * Live credit/status check for every Apify account in the pool.
+ * Decrypts each credential server-side, calls /v2/users/me, and reports
+ * username, plan, and whether the key is working. This is the "check" button
+ * the dashboard calls — it never exposes the keys.
+ */
+providerRoutes.get('/providers/credits/apify', async (c) => {
+  const rows = await c.env.DB.prepare(
+    `SELECT a.account_label, c.ciphertext, c.iv, c.auth_tag
+       FROM provider_credentials c
+       JOIN provider_accounts a ON a.id = c.account_id
+      WHERE a.provider = 'apify' AND a.status = 'active'
+      ORDER BY a.account_label ASC`,
+  ).all<{ account_label: string; ciphertext: string; iv: string; auth_tag: string }>();
+
+  const { openSecret } = await import('../lib/crypto');
+  const results = [];
+  for (const row of (rows.results ?? [])) {
+    try {
+      const secret = await openSecret(
+        { ciphertext: row.ciphertext, iv: row.iv, auth_tag: row.auth_tag },
+        c.env.VAULT_KEY,
+      );
+      const resp = await fetch(
+        `https://api.apify.com/v2/users/me?token=${encodeURIComponent(secret)}`,
+        { headers: { 'User-Agent': 'jepy-worker/1.0' } },
+      );
+      if (!resp.ok) {
+        results.push({ account_label: row.account_label, working: false, error: `HTTP ${resp.status}` });
+        continue;
+      }
+      const body = (await resp.json()) as {
+        data?: { username?: string; plan?: { id?: string }; usage?: unknown };
+      };
+      results.push({
+        account_label: row.account_label,
+        working: !!body.data?.username,
+        username: body.data?.username ?? null,
+        plan: body.data?.plan?.id ?? null,
+      });
+    } catch (e) {
+      results.push({
+        account_label: row.account_label,
+        working: false,
+        error: e instanceof Error ? e.message.slice(0, 100) : 'unknown',
+      });
+    }
+  }
+  return c.json(ok({ accounts: results, checked_at: Math.floor(Date.now() / 1000) }));
+});
