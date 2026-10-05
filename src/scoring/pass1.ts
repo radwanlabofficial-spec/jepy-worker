@@ -15,7 +15,7 @@ import { z } from 'zod';
 
 export const PASS1_PROMPT_VERSION = '2';
 export const PASS1_BATCH_SIZE = 10;
-export const PASS1_TIMEOUT_MS = 30_000;
+export const PASS1_TIMEOUT_MS = 120_000;
 export const AI_DEFAULT_DAILY_CAP = 200;
 export const AI_DEDUPE_SECONDS = 86_400;
 
