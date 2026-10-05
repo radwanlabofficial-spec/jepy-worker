@@ -240,6 +240,38 @@ deviceRoutes.post('/devices/heartbeat', async (c) => {
  * and nowhere else, ever — no log line, no column, no second read. An operator
  * who loses it issues a new device; there is no recovery path, which is the point.
  */
+/**
+ * Console alias for device registration. The dashboard calls `POST /api/devices`
+ * (not `/api/admin/devices`), so this is the endpoint the "Register a device"
+ * button actually hits. Same handler, same validation, same one-time token.
+ */
+deviceRoutes.post('/devices', async (c) => {
+  const parsed = issueSchema.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) {
+    const { body, status } = fail('E_VALIDATION');
+    return c.json(body, status as 400);
+  }
+
+  const { token, hash } = await newDeviceToken();
+  const id = crypto.randomUUID();
+
+  await c.env.DB.prepare(
+    `INSERT INTO devices (id, device_label, token_hash, mode, current_directive, pack_epoch, status)
+     VALUES (?, ?, ?, ?, 'run', 0, 'active')`,
+  )
+    .bind(id, parsed.data.device_label, hash, parsed.data.mode ?? 'both')
+    .run();
+
+  return c.json(
+    ok({
+      id,
+      device_label: parsed.data.device_label,
+      token,
+      note: 'This token is shown once and is stored only as a SHA-256 hash. Copy it now.',
+    }),
+  );
+});
+
 deviceRoutes.post('/admin/devices', async (c) => {
   const parsed = issueSchema.safeParse(await c.req.json().catch(() => ({})));
   if (!parsed.success) {
