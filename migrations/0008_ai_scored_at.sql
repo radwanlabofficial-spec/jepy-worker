@@ -1,0 +1,13 @@
+-- 0008_ai_scored_at.sql — formalize the ai_scored_at column on leads.
+--
+-- WHY THIS EXISTS. During the 2026-10-05 Pass 1 smoke test, schema drift was
+-- discovered: the scoring engine writes `ai_scored_at` (epoch seconds when the
+-- AI pass last scored the lead) but no migration had ever added the column.
+-- It was added ad-hoc via `ALTER TABLE leads ADD COLUMN ai_scored_at INTEGER`
+-- to unblock production. This migration formalizes that change so the schema
+-- history matches reality. SQLite/D1 ALTER TABLE ADD COLUMN is idempotent-safe
+-- here because D1 applies migrations exactly once in order; this file exists
+-- for the record, not to re-run the ALTER.
+--
+-- Column: leads.ai_scored_at INTEGER NULL — epoch seconds of last AI scoring.
+ALTER TABLE leads ADD COLUMN ai_scored_at INTEGER;
