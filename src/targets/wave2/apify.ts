@@ -34,9 +34,9 @@ export interface ApifyRunConfig {
 }
 
 export const DEFAULT_ACTORS = {
-  hiring: 'apify/linkedin-jobs-scraper',
+  hiring: 'curious_coder/linkedin-jobs-scraper',
   ads: 'apify/facebook-ads-scraper',
-  funding: 'apify/news-scraper',
+  funding: 'nexgendata/startup-funding-tracker',
 } as const;
 
 function runSyncUrl(actor: string): string {
