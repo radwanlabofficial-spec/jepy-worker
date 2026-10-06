@@ -502,3 +502,42 @@ leadRoutes.post('/leads/:id/verify-yelp', async (c) => {
   });
   return c.json(ok({ job_id: jobId, lead_id: leadId, status: 'pending' }));
 });
+
+/**
+ * Export leads as CSV. Accepts the same filter shape as the list endpoint;
+ * returns a CSV string (not a file download — the dashboard triggers the
+ * browser download from the response text).
+ *
+ * Capped at 10,000 rows: a larger export belongs in the job queue, not in a
+ * single request.
+ */
+leadRoutes.post('/leads/export', async (c) => {
+  const body = (await c.req.json().catch(() => ({}))) as { tier?: string; niche?: string; limit?: number };
+  const limit = Math.min(body.limit ?? 1000, 10_000);
+
+  let where = `WHERE deleted_at IS NULL`;
+  const binds: unknown[] = [];
+  if (body.tier) { where += ` AND tier = ?`; binds.push(body.tier); }
+  if (body.niche) { where += ` AND niche = ?`; binds.push(body.niche); }
+
+  const rows = await c.env.DB.prepare(
+    `SELECT id, name, domain, website_url, phone_e164, tier, rule_score, final_score, niche, created_at
+     FROM leads ${where} ORDER BY final_score DESC NULLS LAST LIMIT ?`,
+  )
+    .bind(...binds, limit)
+    .all<Record<string, unknown>>();
+
+  const headers = ['id','name','domain','website_url','phone_e164','tier','rule_score','final_score','niche','created_at'];
+  const escape = (v: unknown): string => {
+    const s = v === null || v === undefined ? '' : String(v);
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const lines = [headers.join(',')];
+  for (const r of rows.results ?? []) {
+    lines.push(headers.map((h) => escape(r[h])).join(','));
+  }
+
+  return new Response(lines.join('\n'), {
+    headers: { 'content-type': 'text/csv; charset=utf-8' },
+  });
+});
