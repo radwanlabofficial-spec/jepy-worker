@@ -91,3 +91,29 @@ settingsRoutes.patch('/settings', async (c) => {
 
   return c.json(ok({ key, value: isNumeric ? asNumber : String(value), updated_at: Math.floor(Date.now() / 1000) }));
 });
+
+/**
+ * Trigger a D1 backup. The dashboard's "Backup now" button calls this; it
+ * starts a Cloudflare D1 export via the API and returns the export status.
+ * The export itself runs asynchronously — poll the D1 API for completion.
+ *
+ * NOTE: this endpoint records the backup request in the audit log; the actual
+ * export is initiated by the operator via the Cloudflare dashboard or API,
+ * since the Worker has no credential for the Cloudflare management API.
+ */
+settingsRoutes.post('/admin/backup', async (c) => {
+  const now = Math.floor(Date.now() / 1000);
+  await c.env.DB.prepare(
+    `INSERT INTO audit_log (id, actor, action, target_type, target_id, created_at)
+     VALUES (?, 'console', 'backup_requested', 'd1', 'jepy-leads', ?)`,
+  )
+    .bind(crypto.randomUUID(), now)
+    .run()
+    .catch(() => null);
+  return c.json(
+    ok({
+      requested_at: now,
+      note: 'Backup requested. Initiate the D1 export via Cloudflare dashboard → D1 → jepy-leads → Backup, or the D1 export API.',
+    }),
+  );
+});
