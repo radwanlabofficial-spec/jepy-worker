@@ -350,3 +350,33 @@ function safeParse(raw: string): unknown {
     return null;
   }
 }
+
+/**
+ * Revoke a device. DELETE is the dashboard's "Revoke" button; it is equivalent
+ * to setting the directive to 'revoke' — the device row stays for audit, the
+ * token stops working on the next heartbeat.
+ */
+deviceRoutes.delete('/devices/:id', async (c) => {
+  const result = await c.env.DB.prepare(
+    `UPDATE devices SET current_directive = 'revoke', status = 'revoked' WHERE id = ?`,
+  )
+    .bind(c.req.param('id'))
+    .run();
+  if ((result.meta.changes ?? 0) === 0) {
+    const { body, status } = fail('E_NOT_FOUND', { reason: 'unknown_device' });
+    return c.json(body, status as 404);
+  }
+  return c.json(ok({ id: c.req.param('id'), status: 'revoked' }));
+});
+deviceRoutes.delete('/admin/devices/:id', async (c) => {
+  const result = await c.env.DB.prepare(
+    `UPDATE devices SET current_directive = 'revoke', status = 'revoked' WHERE id = ?`,
+  )
+    .bind(c.req.param('id'))
+    .run();
+  if ((result.meta.changes ?? 0) === 0) {
+    const { body, status } = fail('E_NOT_FOUND', { reason: 'unknown_device' });
+    return c.json(body, status as 404);
+  }
+  return c.json(ok({ id: c.req.param('id'), status: 'revoked' }));
+});
