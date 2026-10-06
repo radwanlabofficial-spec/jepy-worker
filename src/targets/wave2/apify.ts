@@ -44,7 +44,11 @@ function runSyncUrl(actor: string): string {
   // Free-plan actors need ~2min (cold start + scrape); the 60s default
   // kills them mid-flight and returns empty. 300s stays under the Worker's
   // own limits while giving the actor room to finish.
-  return `https://api.apify.com/v2/acts/${actor}/run-sync-get-dataset-items?token={token}&timeout=300`;
+  //
+  // NOTE: actor IDs use a TILDE (~) in the URL path, not a slash:
+  //   curious_coder~linkedin-jobs-scraper  (not curious_coder/linkedin-jobs-scraper)
+  const path = actor.replace('/', '~');
+  return `https://api.apify.com/v2/acts/${path}/run-sync-get-dataset-items?token={token}&timeout=300`;
 }
 
 /**
