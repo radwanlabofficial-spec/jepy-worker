@@ -33,7 +33,6 @@ import { SIGNAL_TTL_SECONDS, type ActorKind, type RawActorRecord, type SignalWri
 
 interface LeadRow {
   id: string;
-  company_name: string | null;
   name: string | null;
 }
 
@@ -161,12 +160,12 @@ export async function collectWave2(
   options: { timeoutMs?: number; families?: ActorKind[] } = {},
 ): Promise<Wave2Result | null> {
   const lead = await db
-    .prepare(`SELECT id, company_name, name FROM leads WHERE id = ? AND deleted_at IS NULL`)
+    .prepare(`SELECT id, name FROM leads WHERE id = ? AND deleted_at IS NULL`)
     .bind(leadId)
     .first<LeadRow>();
   if (!lead) return null;
 
-  const company = lead.company_name ?? lead.name;
+  const company = lead.name;
   if (!company) {
     return { lead_id: leadId, signals_written: 0, families: { hiring: 'no_signal', ads: 'no_signal', funding: 'no_signal' } };
   }
