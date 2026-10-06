@@ -217,7 +217,7 @@ const MAX_WAVE2_LEADS_PER_RUN = 2;
 const signalsRunSchema = z.object({
   lead_ids: z.array(z.string().min(1)).min(1).max(10),
   families: z.array(z.enum(['hiring', 'ads', 'funding'])).min(1).optional(),
-  timeout_ms: z.number().int().min(1000).max(120_000).optional(),
+  timeout_ms: z.number().int().min(1000).max(300_000).optional(),
 });
 
 pipelineRoutes.post('/admin/signals/run', async (c) => {
