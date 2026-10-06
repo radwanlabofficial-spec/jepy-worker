@@ -40,6 +40,8 @@ export interface Wave2Result {
   lead_id: string;
   signals_written: number;
   families: Record<ActorKind, 'ok' | 'no_signal' | 'error'>;
+  /** Debug: per-family failure detail (never contains keys) */
+  debug?: Record<ActorKind, string>;
 }
 
 /**
@@ -93,20 +95,20 @@ async function bumpQuota(db: D1Database, accountLabel: string): Promise<void> {
  * one place. The credential is resolved from the Vault at call time via the
  * account's credential ref — this function never sees the key.
  */
-async function runActor(
+async function runActorWithDetail(
   db: D1Database,
   env: { VAULT_KEY: string },
   accountLabel: string,
   kind: ActorKind,
   config: ApifyRunConfig,
   timeoutMs: number,
-): Promise<unknown[]> {
+): Promise<{ records: unknown[]; detail: string }> {
   // Resolve the account and its credential row.
   const account = await db
     .prepare(`SELECT id FROM provider_accounts WHERE provider = 'apify' AND account_label = ?`)
     .bind(accountLabel)
     .first<{ id: string }>();
-  if (!account) return [];
+  if (!account) return { records: [], detail: 'no_apify_account' };
 
   // The Vault is opened here, inside the call frame: no plaintext key ever
   // reaches a payload, a log line, or D1 (R1, R2).
@@ -143,8 +145,17 @@ async function runActor(
   } as unknown as AdapterInvocation;
 
   const outcome = await apiJsonAdapter.run(invocation);
-  if (outcome.outcome !== 'success' || !Array.isArray(outcome.records)) return [];
-  return outcome.records as unknown[];
+  if (outcome.outcome !== 'success') {
+    return { records: [], detail: `adapter:${outcome.outcome}:${outcome.error_code ?? 'unknown'}` };
+  }
+  if (!Array.isArray(outcome.records)) {
+    return { records: [], detail: 'adapter:success:records_not_array' };
+  }
+  const recs = outcome.records as unknown[];
+  return {
+    records: recs,
+    detail: recs.length === 0 ? 'adapter:success:empty_dataset' : `adapter:success:${recs.length}_records`,
+  };
 }
 
 /**
@@ -192,20 +203,24 @@ export async function collectWave2(
   };
 
   const writes: SignalWrite[] = [];
+  const debug: Record<ActorKind, string> = { hiring: '', ads: '', funding: '' };
   for (const kind of families) {
     try {
-      const records = await runActor(db, env, accountLabel, kind, configs[kind](), timeoutMs);
+      const runResult = await runActorWithDetail(db, env, accountLabel, kind, configs[kind](), timeoutMs);
       await bumpQuota(db, accountLabel);
-      if (records.length === 0) continue;
-      const signals = normalizeBuyingSignals(kind, records as RawActorRecord[], company);
+      debug[kind] = runResult.detail;
+      if (runResult.records.length === 0) continue;
+      const signals = normalizeBuyingSignals(kind, runResult.records as RawActorRecord[], company);
       if (signals.length > 0) {
         result.families[kind] = 'ok';
         writes.push(...signals);
       }
-    } catch {
+    } catch (e) {
       result.families[kind] = 'error';
+      debug[kind] = e instanceof Error ? e.message.slice(0, 200) : String(e).slice(0, 200);
     }
   }
+  result.debug = debug;
 
   if (writes.length > 0) {
     const statements = writes.map((s) =>
