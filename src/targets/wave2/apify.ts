@@ -62,8 +62,9 @@ export function hiringRunConfig(
       method: 'POST',
       auth_query: 'token',
       json_body: {
-        title: company,
-        maxItems,
+        companyName: company,
+        datePosted: 'month',
+        pagesToFetch: 2,
       },
     },
   };
