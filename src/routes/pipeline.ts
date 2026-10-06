@@ -191,3 +191,66 @@ pipelineRoutes.get('/admin/probes/status', async (c) => {
     }),
   );
 });
+
+/**
+ * Wave 2 buying signals — the paid counterpart to `/admin/probes/run`.
+ *
+ * WHERE THE MONEY GOES. Each lead runs up to three Apify actors (hiring, ads,
+ * funding), each a paid API call against the 20-account pool. R15's 40
+ * sub-request ceiling still applies, but the binding constraint here is cost,
+ * not sub-requests: three actor runs per lead means the default limit is 2
+ * leads per invocation. An operator asking for more gets 2 and a note.
+ *
+ * WHY NOT THE QUEUE. Like `/admin/probes/run`, this endpoint executes rather
+ * than enqueues — but unlike Wave 1, it spends paid credit doing so. That is
+ * legitimate only because it is an explicitly manual, admin-gated handle for
+ * controlled testing (STEP 14). Production Wave 2 runs go through the job
+ * queue with quota guards; this endpoint is the smoke-test path.
+ */
+
+import { collectWave2 } from '../targets/wave2/collect';
+import type { ActorKind } from '../targets/wave2/types';
+
+/** Three actor runs per lead; keep well under R15 and under budget. */
+const MAX_WAVE2_LEADS_PER_RUN = 2;
+
+const signalsRunSchema = z.object({
+  lead_ids: z.array(z.string().min(1)).min(1).max(10),
+  families: z.array(z.enum(['hiring', 'ads', 'funding'])).min(1).optional(),
+  timeout_ms: z.number().int().min(1000).max(120_000).optional(),
+});
+
+pipelineRoutes.post('/admin/signals/run', async (c) => {
+  const parsed = signalsRunSchema.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) {
+    const { body, status } = fail('E_VALIDATION');
+    return c.json(body, status as 400);
+  }
+
+  const requested = parsed.data.lead_ids.length;
+  const leadIds = parsed.data.lead_ids.slice(0, MAX_WAVE2_LEADS_PER_RUN);
+  const families = (parsed.data.families ?? ['hiring', 'ads', 'funding']) as ActorKind[];
+
+  const results: Record<string, unknown>[] = [];
+  for (const leadId of leadIds) {
+    const collected = await collectWave2(c.env.DB, c.env, leadId, {
+      timeoutMs: parsed.data.timeout_ms ?? 60_000,
+      families,
+    });
+    if (!collected) continue;
+    results.push({
+      lead_id: collected.lead_id,
+      signals_written: collected.signals_written,
+      families: collected.families,
+    });
+  }
+
+  const notes: string[] = [];
+  if (requested > MAX_WAVE2_LEADS_PER_RUN) {
+    notes.push(
+      `requested ${requested} leads, ran ${MAX_WAVE2_LEADS_PER_RUN}: Wave 2 spends paid Apify credit, so the per-invocation cap is ${MAX_WAVE2_LEADS_PER_RUN}`,
+    );
+  }
+
+  return c.json(ok({ leads: results, notes }));
+});
