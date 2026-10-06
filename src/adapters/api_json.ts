@@ -94,10 +94,21 @@ export const apiJsonAdapter: Adapter = {
       finalUrl = withKey.toString();
     }
 
+    const method = typeof invocation.input.method === 'string' ? invocation.input.method : 'GET';
+
+    // POST/PUT/PATCH bodies: `input.json_body` is serialized as JSON. This is
+    // how Apify's run-sync endpoint receives actor input — the adapter stays
+    // generic, the body shape comes from config.
+    let requestBody: string | undefined;
+    if ((method === 'POST' || method === 'PUT' || method === 'PATCH') && invocation.input.json_body) {
+      requestBody = JSON.stringify(invocation.input.json_body);
+      headers['Content-Type'] = 'application/json';
+    }
+
     try {
       const response = await fetchWithDeadline(
         finalUrl,
-        { method: typeof invocation.input.method === 'string' ? invocation.input.method : 'GET', headers },
+        { method, headers, ...(requestBody ? { body: requestBody } : {}) },
         invocation.budget.deadline_ms,
       );
       const body = await response.text();
