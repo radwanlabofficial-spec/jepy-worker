@@ -40,7 +40,11 @@ export const DEFAULT_ACTORS = {
 } as const;
 
 function runSyncUrl(actor: string): string {
-  return `https://api.apify.com/v2/acts/${actor}/run-sync-get-dataset-items?token={token}`;
+  // timeout=300: the actor RUN budget in seconds, not an HTTP timeout.
+  // Free-plan actors need ~2min (cold start + scrape); the 60s default
+  // kills them mid-flight and returns empty. 300s stays under the Worker's
+  // own limits while giving the actor room to finish.
+  return `https://api.apify.com/v2/acts/${actor}/run-sync-get-dataset-items?token={token}&timeout=300`;
 }
 
 /**
