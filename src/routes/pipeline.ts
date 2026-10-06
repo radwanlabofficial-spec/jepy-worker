@@ -242,6 +242,7 @@ pipelineRoutes.post('/admin/signals/run', async (c) => {
       lead_id: collected.lead_id,
       signals_written: collected.signals_written,
       families: collected.families,
+      debug: collected.debug,
     });
   }
 
