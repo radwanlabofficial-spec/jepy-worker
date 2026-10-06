@@ -8,7 +8,7 @@
 
 import { Hono } from 'hono';
 import type { Handler } from 'hono';
-import { ok, type ApiMeta } from '../lib/envelope';
+import { ok, fail, type ApiMeta } from '../lib/envelope';
 import { decodeCursor, encodeCursor, intParam, readPage } from '../lib/http';
 import type { Actor, Env } from '../env';
 
@@ -183,3 +183,43 @@ const listJobAttempts: Handler<AppEnv> = async (c) => {
 
 jobRoutes.get('/jobs/:id/hops', listJobAttempts);
 jobRoutes.get('/jobs/:id/attempts', listJobAttempts);
+
+/**
+ * Cancel a job. Sets status to 'dead' with a cancellation note — the
+ * dispatcher will never pick up a dead job, and the audit trail keeps the
+ * original attempts.
+ */
+jobRoutes.post('/jobs/:id/cancel', async (c) => {
+  const id = c.req.param('id');
+  const result = await c.env.DB.prepare(
+    `UPDATE job_queue SET status = 'dead', last_error = 'cancelled by operator', updated_at = unixepoch()
+     WHERE id = ? AND status IN ('pending', 'claimed', 'running', 'failed', 'needs_manual')`,
+  )
+    .bind(id)
+    .run();
+  if ((result.meta.changes ?? 0) === 0) {
+    const { body, status } = fail('E_NOT_FOUND', { reason: 'job not found or already terminal' });
+    return c.json(body, status as 400);
+  }
+  return c.json(ok({ id, status: 'dead' }));
+});
+
+/**
+ * Retry a job as a new attempt. Resets a failed/dead job to pending with
+ * attempts incremented — the router will pick it up on the next tick.
+ */
+jobRoutes.post('/jobs/:id/retry', async (c) => {
+  const id = c.req.param('id');
+  const result = await c.env.DB.prepare(
+    `UPDATE job_queue SET status = 'pending', attempts = attempts + 1, last_error = NULL,
+       claimed_by = NULL, claimed_at = NULL, run_after = unixepoch(), updated_at = unixepoch()
+     WHERE id = ? AND status IN ('failed', 'dead', 'needs_manual')`,
+  )
+    .bind(id)
+    .run();
+  if ((result.meta.changes ?? 0) === 0) {
+    const { body, status } = fail('E_NOT_FOUND', { reason: 'job not found or not retryable' });
+    return c.json(body, status as 400);
+  }
+  return c.json(ok({ id, status: 'pending' }));
+});
