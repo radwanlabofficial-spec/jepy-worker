@@ -71,7 +71,7 @@ export function hiringRunConfig(
       auth_query: 'token',
       json_body: {
         companyName: company,
-        datePosted: 'month',
+        datePosted: 'pastMonth',
         pagesToFetch: 2,
       },
     },
