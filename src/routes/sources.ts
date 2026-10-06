@@ -598,3 +598,37 @@ sourceRoutes.post('/sources/manual/:sourceKey/override', async (c) => {
     202,
   );
 });
+
+/**
+ * Start a dataset import. The dashboard's "Start import" button calls this;
+ * it creates the import ledger row and returns the import_id. The caller then
+ * streams chunks via `/admin/import/chunk` and closes with `/admin/import/finish`.
+ *
+ * This is the console-facing alias for `/admin/import/start` — same validation,
+ * same ledger. The admin path stays for cron/GitHub Actions.
+ */
+sourceRoutes.post('/sources/imports', async (c) => {
+  const body = (await c.req.json().catch(() => ({}))) as {
+    dataset?: string; release_version?: string; geo_target_id?: string; runner?: string;
+  };
+  if (!body.dataset || !body.release_version || !body.geo_target_id) {
+    const { body: eb, status } = fail('E_VALIDATION', { reason: 'dataset, release_version, geo_target_id required' });
+    return c.json(eb, status as 400);
+  }
+  const geo = await c.env.DB.prepare(`SELECT id FROM geo_targets WHERE id = ?`)
+    .bind(body.geo_target_id)
+    .first<{ id: string }>();
+  if (!geo) {
+    const { body: eb, status } = fail('E_NOT_FOUND', { reason: 'unknown_geo_target' });
+    return c.json(eb, status as 404);
+  }
+  const id = crypto.randomUUID();
+  await c.env.DB.prepare(
+    `INSERT INTO dataset_imports
+       (id, dataset, release_version, geo_target_id, runner, status, started_at, rows_read, rows_kept, rows_inserted, rows_deduped)
+     VALUES (?, ?, ?, ?, ?, 'running', unixepoch(), 0, 0, 0, 0)`,
+  )
+    .bind(id, body.dataset, body.release_version, body.geo_target_id, body.runner ?? 'console')
+    .run();
+  return c.json(ok({ import_id: id }));
+});
