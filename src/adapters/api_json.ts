@@ -116,9 +116,12 @@ export const apiJsonAdapter: Adapter = {
 
       if (!response.ok) {
         const { outcome, error_code } = classifyHttp(response.status);
+        // Include the first 300 chars of the error body for debugging —
+        // Apify returns JSON with the actual validation error here.
+        const bodySnippet = body.slice(0, 300);
         return buildOutcome(invocation, {
           outcome,
-          error_code,
+          error_code: bodySnippet ? `${error_code}:${bodySnippet}` : error_code,
           http_status: response.status,
           latency_ms: latency,
           units: 1,
