@@ -401,3 +401,28 @@ scoringRoutes.get('/scoring/leads/:id/breakdown', async (c) => {
     }),
   );
 });
+
+/**
+ * Create a new weights version. The dashboard's "New version" button calls
+ * this with a map of feature_key → weight. The new version is inserted with
+ * applied=0 (not active) — activating it is a separate, reviewable step via
+ * the feedback loop, so computing a lift and shipping it stay distinct.
+ */
+scoringRoutes.post('/scoring/weights', async (c) => {
+  const body = (await c.req.json().catch(() => ({}))) as { weights?: Record<string, number>; note?: string };
+  if (!body.weights || typeof body.weights !== 'object' || Object.keys(body.weights).length === 0) {
+    const { body: eb, status } = fail('E_VALIDATION', { reason: 'weights map required' });
+    return c.json(eb, status as 400);
+  }
+  const maxRow = await c.env.DB.prepare(`SELECT COALESCE(MAX(version), 0) AS v FROM score_weights`).first<{ v: number }>();
+  const version = (maxRow?.v ?? 0) + 1;
+  const now = Math.floor(Date.now() / 1000);
+  const statements = Object.entries(body.weights).map(([feature_key, weight]) =>
+    c.env.DB.prepare(
+      `INSERT INTO score_weights (version, feature_key, weight, created_at, applied, note)
+       VALUES (?, ?, ?, ?, 0, ?)`,
+    ).bind(version, feature_key, weight, now, body.note ?? null),
+  );
+  await c.env.DB.batch(statements);
+  return c.json(ok({ version, features: Object.keys(body.weights).length, applied: 0 }));
+});
