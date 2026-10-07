@@ -209,6 +209,7 @@ pipelineRoutes.get('/admin/probes/status', async (c) => {
  */
 
 import { collectWave2 } from '../targets/wave2/collect';
+import { startApifyRuns, pollApifyRuns } from '../targets/wave2/async';
 import type { ActorKind } from '../targets/wave2/types';
 
 /** Three actor runs per lead; keep well under R15 and under budget. */
@@ -254,4 +255,59 @@ pipelineRoutes.post('/admin/signals/run', async (c) => {
   }
 
   return c.json(ok({ leads: results, notes }));
+});
+
+/**
+ * POST /api/admin/signals/run-async
+ *
+ * Starts Apify actor runs for the given leads WITHOUT waiting for results.
+ * Returns immediately (<5s) with run IDs. Call /signals/poll to collect results.
+ */
+pipelineRoutes.post('/admin/signals/run-async', async (c) => {
+  const parsed = signalsRunSchema.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) {
+    const { body, status } = fail('E_VALIDATION');
+    return c.json(body, status as 400);
+  }
+
+  const requested = parsed.data.lead_ids.length;
+  const leadIds = parsed.data.lead_ids.slice(0, MAX_WAVE2_LEADS_PER_RUN);
+  const families = (parsed.data.families ?? ['hiring', 'ads', 'funding']) as ActorKind[];
+
+  const results: Record<string, unknown>[] = [];
+  for (const leadId of leadIds) {
+    const { started, errors } = await startApifyRuns(c.env.DB, c.env, leadId, families);
+    results.push({ lead_id: leadId, started, errors });
+  }
+
+  return c.json(ok({
+    leads: results,
+    hint: 'Runs started. Call POST /api/admin/signals/poll every few minutes to collect results.',
+  }));
+});
+
+/**
+ * POST /api/admin/signals/poll
+ *
+ * Checks all pending Apify runs, fetches completed results, writes signals.
+ * Fast (<10s) and idempotent. Call repeatedly until no pending runs remain.
+ */
+pipelineRoutes.post('/admin/signals/poll', async (c) => {
+  const result = await pollApifyRuns(c.env.DB, c.env);
+  return c.json(ok(result));
+});
+
+/**
+ * GET /api/admin/signals/runs
+ *
+ * Lists recent Apify runs with their status.
+ */
+pipelineRoutes.get('/admin/signals/runs', async (c) => {
+  const limit = Math.min(parseInt(c.req.query('limit') ?? '20', 10) || 20, 100);
+  const rows = await c.env.DB.prepare(
+    `SELECT id, lead_id, family, actor, apify_run_id, status, signals_written,
+            started_at, updated_at, error
+     FROM apify_runs ORDER BY started_at DESC LIMIT ?`,
+  ).bind(limit).all();
+  return c.json(ok({ runs: rows.results ?? [] }));
 });
