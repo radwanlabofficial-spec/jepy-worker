@@ -319,12 +319,17 @@ vaultRoutes.get('/vault/apify-usage', async (c) => {
         username: data.username ?? null,
         plan_id: plan.id ?? null,
         plan_name: plan.name ?? null,
-        // Monthly compute units (the main Apify billing metric)
-        monthly_usage_usd: data.monthlyUsage ?? null,
-        monthly_limit_usd: plan.monthlyUsageLimit ?? plan.usageLimit ?? null,
-        // Reset date: Apify billing cycle
+        // Apify returns usage in various fields depending on plan type.
+        // Include raw values for the dashboard to display.
+        monthly_usage_usd: data.monthlyUsage ?? data.usage?.monthlyUsage ?? null,
+        monthly_limit_usd: plan.monthlyUsageLimit ?? plan.usageLimit ?? plan.monthlyLimit ?? null,
+        compute_units_used: data.computeUnitsUsed ?? null,
+        compute_units_limit: plan.computeUnitsLimit ?? null,
+        // Billing period
         current_period_start: data.currentMonthlyBillingPeriodStart ?? null,
         current_period_end: data.currentMonthlyBillingPeriodEnd ?? null,
+        // Raw plan object for debugging/display
+        _plan_keys: Object.keys(plan),
       });
     } catch {
       results.push({ account_label: row.account_label, error: 'fetch_failed' });
