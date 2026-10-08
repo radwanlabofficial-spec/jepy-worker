@@ -65,7 +65,7 @@ bucket_name = "jepy-raw"
 # POST /api/admin/run-cron when waiting is not acceptable.
 [triggers]
 crons = [
-  "*/2 * * * *",  # dispatcher — claims due jobs every two minutes
+  "*/5 * * * *",  # dispatcher — claims due jobs every five minutes (D1 saver)
   "0 * * * *",    # hourly tick — budget guard always, plus whatever is due
 ]
 
