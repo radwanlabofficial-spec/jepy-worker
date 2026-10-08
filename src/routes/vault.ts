@@ -313,23 +313,38 @@ vaultRoutes.get('/vault/apify-usage', async (c) => {
       const body = (await res.json()) as any;
       const data = body.data ?? {};
       const plan = data.plan ?? {};
+      const userId = data.id;
+
+      // Fetch monthly usage from the usage endpoint
+      let usage = null;
+      if (userId) {
+        try {
+          const uRes = await fetch(
+            `https://api.apify.com/v2/users/${userId}/usage/monthly?token=${encodeURIComponent(secret)}`,
+            { signal: controller.signal },
+          );
+          if (uRes.ok) {
+            const uBody = (await uRes.json()) as any;
+            usage = uBody.data ?? uBody;
+          }
+        } catch { /* usage optional */ }
+      }
 
       results.push({
         account_label: row.account_label,
         username: data.username ?? null,
         plan_id: plan.id ?? null,
-        plan_name: plan.name ?? null,
-        // Apify returns usage in various fields depending on plan type.
-        // Include raw values for the dashboard to display.
-        monthly_usage_usd: data.monthlyUsage ?? data.usage?.monthlyUsage ?? null,
-        monthly_limit_usd: plan.monthlyUsageLimit ?? plan.usageLimit ?? plan.monthlyLimit ?? null,
-        compute_units_used: data.computeUnitsUsed ?? null,
-        compute_units_limit: plan.computeUnitsLimit ?? null,
+        // Limits from plan
+        monthly_limit_usd: plan.maxMonthlyUsageUsd ?? null,
+        monthly_credits_usd: plan.monthlyUsageCreditsUsd ?? null,
+        compute_units_limit: plan.maxMonthlyActorComputeUnits ?? null,
+        proxy_gb_limit: plan.maxMonthlyResidentialProxyGbytes ?? null,
+        // Actual usage (if available)
+        usage_usd: usage?.monthlyUsageUsd ?? usage?.usageUsd ?? null,
+        compute_units_used: usage?.computeUnits ?? null,
         // Billing period
-        current_period_start: data.currentMonthlyBillingPeriodStart ?? null,
-        current_period_end: data.currentMonthlyBillingPeriodEnd ?? null,
-        // Raw plan object for debugging/display
-        _plan_keys: Object.keys(plan),
+        period_start: usage?.periodStart ?? null,
+        period_end: usage?.periodEnd ?? null,
       });
     } catch {
       results.push({ account_label: row.account_label, error: 'fetch_failed' });
