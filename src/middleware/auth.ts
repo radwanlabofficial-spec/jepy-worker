@@ -75,6 +75,13 @@ export async function resolveActor(c: Context<{ Bindings: Env }>): Promise<Actor
     }
   }
 
+  // Temporary open-console mode: when CONSOLE_OPEN=1 and the request comes
+  // through the dashboard's Pages Function proxy (which sets X-Console-Open),
+  // grant a limited human actor. Admin-only routes still require X-Admin-Secret.
+  if (env.CONSOLE_OPEN === '1' && c.req.header('X-Console-Open') === '1') {
+    return { email: 'console@jepy.local', kind: 'access' };
+  }
+
   // Local development only, and only over the loopback interface. `wrangler dev`
   // serves on 127.0.0.1, so a request from anywhere else cannot reach this path.
   if (env.ENVIRONMENT === 'dev' && isLoopback(c.req.url)) {
