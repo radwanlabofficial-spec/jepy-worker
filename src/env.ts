@@ -59,6 +59,13 @@ export interface Env {
   VAULT_KEY: string;
   /** Server-to-server auth for cron and GitHub Actions. Secret. */
   ADMIN_SECRET: string;
+
+  /**
+   * Temporary: when "1", the console (dashboard) is accessible without
+   * Cloudflare Access. Requests from CONSOLE_ORIGIN get a limited actor.
+   * Set to "0" (or unset) to require Access again.
+   */
+  CONSOLE_OPEN?: string;
 }
 
 /** What a verified Cloudflare Access identity looks like downstream. */
