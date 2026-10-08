@@ -266,3 +266,70 @@ vaultRoutes.get('/vault/testable-providers', async (c) => {
   const { TESTABLE_PROVIDERS } = await import('../lib/provider-test');
   return c.json(ok({ providers: TESTABLE_PROVIDERS }));
 });
+
+/**
+ * Apify usage per account — live credit/limit data like the Content OS settings page.
+ *
+ * For each stored Apify credential, decrypts the token and calls Apify's
+ * `/v2/users/me` which returns plan + monthly usage. Returns per-account:
+ * username, plan id, monthly compute-unit usage vs limit, and reset date.
+ *
+ * This is a live probe (not cached) — the dashboard should call it on Vault
+ * page load and not on every render.
+ */
+vaultRoutes.get('/vault/apify-usage', async (c) => {
+  const rows = await c.env.DB.prepare(
+    `SELECT c.id, a.account_label, c.ciphertext, c.iv, c.auth_tag, c.algo
+       FROM provider_credentials c
+       JOIN provider_accounts a ON a.id = c.account_id
+      WHERE a.provider = 'apify'
+      ORDER BY a.account_label ASC`,
+  ).all();
+
+  const results = [];
+  for (const row of (rows.results ?? []) as any[]) {
+    let secret: string;
+    try {
+      secret = await openSecret(row, c.env.VAULT_KEY);
+    } catch {
+      results.push({ account_label: row.account_label, error: 'vault_key_mismatch' });
+      continue;
+    }
+
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 15000);
+      const res = await fetch(
+        `https://api.apify.com/v2/users/me?token=${encodeURIComponent(secret)}`,
+        { signal: controller.signal },
+      );
+      clearTimeout(timer);
+
+      if (!res.ok) {
+        results.push({ account_label: row.account_label, error: `http_${res.status}` });
+        continue;
+      }
+
+      const body = (await res.json()) as any;
+      const data = body.data ?? {};
+      const plan = data.plan ?? {};
+
+      results.push({
+        account_label: row.account_label,
+        username: data.username ?? null,
+        plan_id: plan.id ?? null,
+        plan_name: plan.name ?? null,
+        // Monthly compute units (the main Apify billing metric)
+        monthly_usage_usd: data.monthlyUsage ?? null,
+        monthly_limit_usd: plan.monthlyUsageLimit ?? plan.usageLimit ?? null,
+        // Reset date: Apify billing cycle
+        current_period_start: data.currentMonthlyBillingPeriodStart ?? null,
+        current_period_end: data.currentMonthlyBillingPeriodEnd ?? null,
+      });
+    } catch {
+      results.push({ account_label: row.account_label, error: 'fetch_failed' });
+    }
+  }
+
+  return c.json(ok({ accounts: results }));
+});
