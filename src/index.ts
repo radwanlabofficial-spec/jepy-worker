@@ -20,6 +20,7 @@ import { isDevicePath } from './middleware/device';
 import type { Actor, Env } from './env';
 
 import { healthRoutes, meRoutes } from './routes/health';
+import { systemRoutes } from './routes/system';
 import { settingsRoutes } from './routes/settings';
 import { leadRoutes } from './routes/leads';
 import { jobRoutes } from './routes/jobs';
@@ -102,6 +103,7 @@ app.get('/', (c) =>
 );
 
 app.route('/api', healthRoutes);
+app.route('/api', systemRoutes);
 app.route('/api', meRoutes);
 app.route('/api', settingsRoutes);
 app.route('/api', leadRoutes);
