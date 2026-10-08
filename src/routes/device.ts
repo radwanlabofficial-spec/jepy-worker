@@ -380,3 +380,51 @@ deviceRoutes.delete('/admin/devices/:id', async (c) => {
   }
   return c.json(ok({ id: c.req.param('id'), status: 'revoked' }));
 });
+
+/**
+ * Request backend scraping when manual (extension) scraping fails.
+ *
+ * Flow: Extension tries manual scrape → fails → calls this endpoint →
+ * Worker creates a job for Apify/BrightData → AI (Manifest) decides which
+ * provider to use → result comes back to dashboard.
+ */
+const requestScrapeSchema = z.object({
+  url: z.string().url().max(2000),
+  reason: z.string().max(500).nullish(), // why manual scraping failed
+  priority: z.enum(['low', 'normal', 'high']).nullish(),
+});
+
+deviceRoutes.post('/devices/request-scrape', requireDevice, async (c) => {
+  const device = c.get('device');
+  const body = await c.req.json().catch(() => ({}));
+  const parsed = requestScrapeSchema.safeParse(body);
+
+  if (!parsed.success) {
+    const { body: errBody, status } = fail('E_VALIDATION', { reason: 'invalid_request' });
+    return c.json(errBody, status as 400);
+  }
+
+  const { url, reason, priority } = parsed.data;
+
+  // Create a scrape job in the queue for backend providers
+  const jobId = crypto.randomUUID();
+  const now = Math.floor(Date.now() / 1000);
+
+  await c.env.DB.prepare(
+    `INSERT INTO job_queue (id, job_type, target_url, status, priority, created_at, requested_by_device)
+     VALUES (?, 'backend_scrape', ?, 'pending', ?, ?, ?)`
+  ).bind(jobId, url, priority ?? 'normal', now, device.id).run().catch(() => {
+    // Table might not have requested_by_device column; try without it
+    return c.env.DB.prepare(
+      `INSERT INTO job_queue (id, job_type, target_url, status, priority, created_at)
+       VALUES (?, 'backend_scrape', ?, 'pending', ?, ?)`
+    ).bind(jobId, url, priority ?? 'normal', now).run();
+  });
+
+  return c.json(ok({
+    job_id: jobId,
+    status: 'queued',
+    message: 'Backend scrape requested. AI will select Apify or BrightData.',
+    manual_failure_reason: reason ?? null,
+  }));
+});
