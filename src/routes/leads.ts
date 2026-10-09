@@ -136,7 +136,25 @@ leadRoutes.get('/leads', async (c) => {
  */
 const MONTHLY_BUDGET_MICRO = 70_000_000; // $70
 
+/**
+ * In-memory stats cache (per worker isolate).
+ *
+ * /api/leads/stats runs 9 D1 queries per call and the dashboard polls it every
+ * 2 minutes — 720 calls/day against the 5M/day free-tier read budget. A 5-minute
+ * TTL collapses that to ~288 D1 round trips/day (fewer while isolates stay
+ * warm), because every poll inside the window is answered from memory with zero
+ * D1 reads. Stats do not need real-time accuracy; `?fresh=1` bypasses the
+ * cache for the dashboard's manual Refresh buttons.
+ */
+const STATS_TTL_MS = 5 * 60 * 1000;
+let statsCache: { at: number; body: object } | null = null;
+
 leadRoutes.get('/leads/stats', async (c) => {
+  const now = Date.now();
+  const fresh = new URL(c.req.url).searchParams.get('fresh') === '1';
+  if (!fresh && statsCache && now - statsCache.at < STATS_TTL_MS) {
+    return c.json(statsCache.body);
+  }
   const [tiers, totals, verified, queue, bdToday, mtd, errors, aiToday, config] =
     await c.env.DB.batch<Record<string, unknown>>([
     c.env.DB.prepare(
@@ -197,8 +215,7 @@ leadRoutes.get('/leads/stats', async (c) => {
 
   // Flat and complete, because the Overview renders all fourteen cards from this
   // one answer and a missing key there reads as a broken panel.
-  return c.json(
-    ok({
+  const payload = ok({
       total: Number(head.total ?? 0),
       by_tier: byTier,
       new_today: Number(head.new_today ?? 0),
@@ -215,8 +232,9 @@ leadRoutes.get('/leads/stats', async (c) => {
       ai_requests_today: Number((aiToday.results ?? [])[0]?.ai_requests_today ?? 0),
       ai_daily_cap: Number(configRow.ai_daily_cap ?? 0),
       gate_threshold: Number(configRow.gate_threshold ?? 0),
-    }),
-  );
+  });
+  statsCache = { at: now, body: payload };
+  return c.json(payload);
 });
 
 leadRoutes.get('/leads/:id', async (c) => {
