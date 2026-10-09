@@ -21,9 +21,16 @@ import { z } from 'zod';
 import { fail, ok } from '../lib/envelope';
 import { last4, openSecret, sealSecret } from '../lib/crypto';
 import { testCredential } from '../lib/provider-test';
+import { requireAdmin } from '../middleware/auth';
 import type { Actor, Env } from '../env';
 
 export const vaultRoutes = new Hono<{ Bindings: Env; Variables: { actor: Actor } }>();
+
+// test-all spends provider quota and reads every stored secret, so it is an
+// admin door (X-Admin-Secret) like the other admin routes — a human console
+// session is refused. The single-credential test above stays on the human path
+// it has always been on; this line gates only the new route.
+vaultRoutes.use('/vault/credentials/test-all', requireAdmin);
 
 vaultRoutes.get('/vault/credentials', async (c) => {
   const result = await c.env.DB.prepare(
@@ -143,43 +150,165 @@ vaultRoutes.post('/vault/credentials', async (c) => {
   return c.json(ok({ id, test_status: outcome.status, message: outcome.message, last4: sealed.last4 }));
 });
 
-vaultRoutes.post('/vault/credentials/:id/test', async (c) => {
-  const id = c.req.param('id');
-  const row = await c.env.DB.prepare(
-    `SELECT c.id, c.ciphertext, c.iv, c.auth_tag, a.provider
+/**
+ * The per-credential test path, shared by the single test endpoint and
+ * test-all below. It decrypts the stored secret and runs the provider check
+ * from lib/provider-test; the callers decide what to do with the outcome
+ * (the single endpoint updates `test_status`, test-all does not, because a
+ * bulk health check should not rewrite verdicts an operator may be acting on).
+ *
+ * `decryptFailed` is its own flag rather than a status because the single
+ * endpoint answers vault-key mismatch with a 502 of its own reason, while
+ * test-all reports it as one row among many.
+ */
+interface CredentialTestRow {
+  id: string;
+  provider: string;
+  account_label: string;
+  ciphertext: string;
+  iv: string;
+  auth_tag: string;
+}
+
+interface CredentialTestOutcome {
+  id: string;
+  provider: string;
+  label: string;
+  status: 'ok' | 'failed' | 'untested';
+  message: string;
+  latency_ms: number;
+  decryptFailed: boolean;
+}
+
+async function testCredentialById(env: Env, id: string): Promise<CredentialTestOutcome | null> {
+  const row = await env.DB.prepare(
+    `SELECT c.id, c.ciphertext, c.iv, c.auth_tag, a.provider, a.account_label
        FROM provider_credentials c JOIN provider_accounts a ON a.id = c.account_id
       WHERE c.id = ?`,
   )
     .bind(id)
-    .first<{ id: string; ciphertext: string; iv: string; auth_tag: string; provider: string }>();
+    .first<CredentialTestRow>();
 
-  if (!row) {
-    const { body, status } = fail('E_NOT_FOUND');
-    return c.json(body, status as 404);
-  }
+  if (!row) return null;
+
+  const started = Date.now();
+  const done = (status: CredentialTestOutcome['status'], message: string, decryptFailed = false) => ({
+    id: row.id,
+    provider: row.provider,
+    label: row.account_label,
+    status,
+    message,
+    latency_ms: Date.now() - started,
+    decryptFailed,
+  });
 
   let secret: string;
   try {
-    secret = await openSecret(row, c.env.VAULT_KEY);
+    secret = await openSecret(row, env.VAULT_KEY);
   } catch {
     // An unopenable row means the key no longer matches this VAULT_KEY. That is
     // a real operational fact and it is stated as itself rather than as a
     // provider failure.
+    return done('failed', 'vault key mismatch — stored secret cannot be decrypted', true);
+  }
+
+  const outcome = await testCredential(row.provider, secret);
+  return done(outcome.status, outcome.message);
+}
+
+vaultRoutes.post('/vault/credentials/:id/test', async (c) => {
+  const outcome = await testCredentialById(c.env, c.req.param('id'));
+
+  if (!outcome) {
+    const { body, status } = fail('E_NOT_FOUND');
+    return c.json(body, status as 404);
+  }
+
+  if (outcome.decryptFailed) {
     const { body, status } = fail('E_CREDENTIAL_INVALID', { reason: 'vault_key_mismatch' });
     return c.json(body, status as 502);
   }
 
-  const outcome = await testCredential(row.provider, secret);
-
   await c.env.DB.prepare(
     `UPDATE provider_credentials SET test_status = ?, last_tested_at = unixepoch() WHERE id = ?`,
   )
-    .bind(outcome.status, id)
+    .bind(outcome.status, outcome.id)
     .run();
 
-  await audit(c.env, c.get('actor'), id, 'test', outcome.status, { provider: row.provider, message: outcome.message });
+  await audit(c.env, c.get('actor'), outcome.id, 'test', outcome.status, {
+    provider: outcome.provider,
+    message: outcome.message,
+  });
 
   return c.json(ok({ test_status: outcome.status, message: outcome.message }));
+});
+
+/**
+ * Test every stored credential in one call (Track D item 12).
+ *
+ * ONE SELECT, then the shared per-credential test path run SEQUENTIALLY — not
+ * in parallel, because each test is a live subrequest to a provider and a
+ * burst of twenty parallel probes looks like abuse and risks tripping the
+ * Worker's subrequest limits. Slow but honest: the response carries per-
+ * credential latency so the operator can see which provider dragged.
+ *
+ * The audit writes go out as a single D1 batch rather than N round-trips, and
+ * test-all does NOT rewrite `test_status`/`last_tested_at` — a bulk health
+ * check reports; it does not overrule verdicts an operator may be acting on.
+ */
+vaultRoutes.post('/vault/credentials/test-all', async (c) => {
+  const rows = await c.env.DB.prepare(
+    `SELECT c.id, a.provider, a.account_label
+       FROM provider_credentials c JOIN provider_accounts a ON a.id = c.account_id
+      ORDER BY a.provider ASC, a.account_label ASC`,
+  ).all<{ id: string; provider: string; account_label: string }>();
+
+  const results: Array<Omit<CredentialTestOutcome, 'decryptFailed'>> = [];
+  const auditStmts = [];
+  const actor = c.get('actor');
+
+  for (const row of rows.results ?? []) {
+    // Sequential by design — see the comment on the route.
+    const outcome = await testCredentialById(c.env, row.id);
+    if (!outcome) continue;
+
+    const { decryptFailed: _dropped, ...publicOutcome } = outcome;
+    results.push(publicOutcome);
+
+    auditStmts.push(
+      c.env.DB.prepare(
+        `INSERT INTO audit_log (id, entity_type, entity_id, action, actor_email, result, detail_json, created_at)
+         VALUES (?, 'credential', ?, 'test', ?, ?, ?, unixepoch())`,
+      ).bind(
+        crypto.randomUUID(),
+        outcome.id,
+        actor.email,
+        outcome.status,
+        JSON.stringify({ test_all: true, provider: outcome.provider, message: outcome.message }),
+      ),
+    );
+  }
+
+  // One round-trip for all audit rows. Deliberately best-effort like the single
+  // audit helper: a lost audit row must never turn a finished test run into an
+  // error for the operator.
+  if (auditStmts.length > 0) {
+    try {
+      await c.env.DB.batch(auditStmts);
+    } catch {
+      // ignore
+    }
+  }
+
+  const okCount = results.filter((r) => r.status === 'ok').length;
+  const failedCount = results.filter((r) => r.status === 'failed').length;
+
+  return c.json(
+    ok({
+      results,
+      summary: { total: results.length, ok: okCount, failed: failedCount },
+    }),
+  );
 });
 
 const rotateSchema = z.object({ secret: z.string().min(4) });

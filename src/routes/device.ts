@@ -382,6 +382,33 @@ deviceRoutes.delete('/admin/devices/:id', async (c) => {
 });
 
 /**
+ * On-demand stale-device sweep (Track D item 11).
+ *
+ * ON-DEMAND COPY of the canonical sweep in `src/jobs/scheduled.ts`
+ * (`sweepStaleDevices`), which the hourly trigger runs and records as
+ * `device_sweep` in `cron_runs`. Cloudflare offers no way to fire a cron on
+ * demand, so this admin route lets the console run the same UPDATE by hand.
+ * The 48-hour rule and the exact predicate live in scheduled.ts — this route
+ * duplicates only the UPDATE, and if the rule changes there it must change
+ * here too. Covered by the existing `deviceRoutes.use('/admin/devices/*',
+ * requireAdmin)` guard above; no second registration needed.
+ */
+deviceRoutes.post('/admin/devices/sweep', async (c) => {
+  const DEVICE_STALE_AFTER_SECONDS = 48 * 3600;
+  const result = await c.env.DB.prepare(
+    `UPDATE devices
+        SET status = 'stale'
+      WHERE status = 'active'
+        AND current_directive != 'revoke'
+        AND COALESCE(last_heartbeat_at, created_at) <= unixepoch() - ?`,
+  )
+    .bind(DEVICE_STALE_AFTER_SECONDS)
+    .run();
+
+  return c.json(ok({ marked_stale: result.meta.changes ?? 0 }));
+});
+
+/**
  * Request backend scraping when manual (extension) scraping fails.
  *
  * Flow: Extension tries manual scrape → fails → calls this endpoint →
@@ -393,6 +420,12 @@ const requestScrapeSchema = z.object({
   reason: z.string().max(500).nullish(), // why manual scraping failed
   priority: z.enum(['low', 'normal', 'high']).nullish(),
 });
+
+/**
+ * Extension-facing priority words mapped onto job_queue's 1–10 integer scale
+ * (the CHECK refuses anything else). 'normal' is the queue default of 5.
+ */
+const SCRAPE_PRIORITY: Record<'low' | 'normal' | 'high', number> = { low: 3, normal: 5, high: 8 };
 
 deviceRoutes.post('/devices/request-scrape', requireDevice, async (c) => {
   const device = c.get('device');
@@ -406,25 +439,39 @@ deviceRoutes.post('/devices/request-scrape', requireDevice, async (c) => {
 
   const { url, reason, priority } = parsed.data;
 
-  // Create a scrape job in the queue for backend providers
+  // WHY THIS SHAPE. The first version of this endpoint inserted
+  // (id, job_type, target_url, ...) with job_type='backend_scrape' and a string
+  // priority — and `target_url` does not exist in job_queue (0001 has
+  // payload_json for that), 'backend_scrape' is not in the job_type CHECK, and
+  // priority must be INTEGER 1–10. Every call 500'd. This insert matches the
+  // canonical queue shape in lib/queue.ts: job_type='scrape' (in the CHECK),
+  // the URL and the failure reason ride in payload_json, and
+  // `requested_by_device` (migration 0017) records which extension asked.
   const jobId = crypto.randomUUID();
   const now = Math.floor(Date.now() / 1000);
 
   await c.env.DB.prepare(
-    `INSERT INTO job_queue (id, job_type, target_url, status, priority, created_at, requested_by_device)
-     VALUES (?, 'backend_scrape', ?, 'pending', ?, ?, ?)`
-  ).bind(jobId, url, priority ?? 'normal', now, device.id).run().catch(() => {
-    // Table might not have requested_by_device column; try without it
-    return c.env.DB.prepare(
-      `INSERT INTO job_queue (id, job_type, target_url, status, priority, created_at)
-       VALUES (?, 'backend_scrape', ?, 'pending', ?, ?)`
-    ).bind(jobId, url, priority ?? 'normal', now).run();
-  });
+    `INSERT INTO job_queue (id, job_type, target_type, payload_json, priority, status, run_after,
+                            created_at, updated_at, requested_by_device)
+     VALUES (?, 'scrape', 'extension_backend_request', ?, ?, 'pending', ?, ?, ?, ?)`,
+  )
+    .bind(
+      jobId,
+      JSON.stringify({ url, manual_failure_reason: reason ?? null, requested_by_device: device.id }),
+      SCRAPE_PRIORITY[priority ?? 'normal'],
+      now,
+      now,
+      now,
+      device.id,
+    )
+    .run();
 
-  return c.json(ok({
-    job_id: jobId,
-    status: 'queued',
-    message: 'Backend scrape requested. AI will select Apify or BrightData.',
-    manual_failure_reason: reason ?? null,
-  }));
+  return c.json(
+    ok({
+      job_id: jobId,
+      status: 'queued',
+      message: 'Backend scrape requested. AI will select Apify or BrightData.',
+      manual_failure_reason: reason ?? null,
+    }),
+  );
 });
