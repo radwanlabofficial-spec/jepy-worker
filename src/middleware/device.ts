@@ -11,7 +11,7 @@
  *
  * So the scope is enforced TWICE, on purpose:
  *
- *   1  only three routes mount this middleware at all
+ *   1  only four routes mount this middleware at all
  *   2  the middleware itself refuses any path outside DEVICE_SCOPE
  *
  * The second check exists because the first one is a line in a different file.
@@ -38,11 +38,15 @@ import { fail } from '../lib/envelope';
 import { hashDeviceToken } from '../lib/device';
 import type { Actor, Env } from '../env';
 
-/** The three paths a device token is allowed to reach. ADR-035. */
+/** The device-token paths. ADR-035 fixed the first three; the extension's
+ * backend-scrape request is the fourth: it is a device-initiated action (the
+ * extension asking for backend help when manual scraping fails), so a device
+ * token is the right credential and the admin secret must not be required. */
 export const DEVICE_SCOPE: readonly string[] = [
   'GET /api/jobs/pending',
   'POST /api/jobs/:id/result',
   'POST /api/devices/heartbeat',
+  'POST /api/devices/request-scrape',
 ];
 
 export interface DeviceRow {
@@ -67,7 +71,7 @@ function normalisePath(method: string, path: string): string {
 }
 
 /**
- * Is this one of ADR-035's three paths?
+ * Is this one of the device-token paths (ADR-035 plus the scrape-request path)?
  *
  * ONE SOURCE OF TRUTH, USED TWICE. The global `/api/*` guard asks this question
  * to decide whether a request has to carry a human identity, and `requireDevice`

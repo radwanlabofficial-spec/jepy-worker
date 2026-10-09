@@ -76,8 +76,8 @@ app.use('/api/*', async (c, next) => {
   // The OTHER door. A browser extension has no Access session and must not hold
   // the admin secret, so it presents a device token instead — and this guard has
   // to let it past to reach `requireDevice`, which is the thing that actually
-  // checks the token. ADR-035 fixes the list at three paths and `isDevicePath`
-  // owns it, so this is a reference rather than a second copy.
+  // checks the token. The device-token path list lives in middleware/device.ts
+  // (`DEVICE_SCOPE`) and `isDevicePath` owns it, so this is a reference rather
   //
   // Without this, every device endpoint answered 401 from HERE and never reached
   // its own check: the extension would have been dead on arrival in production

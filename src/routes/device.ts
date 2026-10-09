@@ -31,6 +31,7 @@ import { requireAdmin } from '../middleware/auth';
 import { requireDevice, isPaused } from '../middleware/device';
 import type { DeviceRow } from '../middleware/device';
 import { newDeviceToken } from '../lib/device';
+import { selectScraper } from '../lib/scraper_select';
 import { claim, complete, fail as failJob } from '../lib/queue';
 import type { Actor, Env } from '../env';
 
@@ -439,6 +440,27 @@ deviceRoutes.post('/devices/request-scrape', requireDevice, async (c) => {
 
   const { url, reason, priority } = parsed.data;
 
+  // Per-device backpressure: a device may not hold more than ten unprocessed
+  // backend-scrape requests at once. Without this a misbehaving extension (or
+  // a page that auto-retries) could flood the queue and starve every other
+  // producer; with it the 11th request gets a 429 and the device backs off.
+  // job_queue is small by design, so this COUNT is cheap.
+  const pending = await c.env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM job_queue
+      WHERE requested_by_device = ? AND target_type = 'extension_backend_request'
+        AND status IN ('pending', 'claimed', 'running')`,
+  )
+    .bind(device.id)
+    .first<{ n: number }>()
+    .catch(() => ({ n: 0 }));
+  if ((pending?.n ?? 0) >= 10) {
+    const { body, status } = fail('E_RATE_LIMIT', {
+      reason: 'too_many_pending_scrape_requests',
+      pending: pending?.n ?? 0,
+    });
+    return c.json(body, status as 429);
+  }
+
   // WHY THIS SHAPE. The first version of this endpoint inserted
   // (id, job_type, target_url, ...) with job_type='backend_scrape' and a string
   // priority — and `target_url` does not exist in job_queue (0001 has
@@ -447,13 +469,24 @@ deviceRoutes.post('/devices/request-scrape', requireDevice, async (c) => {
   // canonical queue shape in lib/queue.ts: job_type='scrape' (in the CHECK),
   // the URL and the failure reason ride in payload_json, and
   // `requested_by_device` (migration 0017) records which extension asked.
+  // The AI decision happens HERE, at request time, not only at claim time.
+  // The claim hook in routes/runners.ts backfills provider_selected for jobs
+  // that lack it, but nothing is guaranteed to claim these rows through
+  // /admin/jobs/claim — so a request that returned "AI will select" without
+  // the selection ever happening would be a lie the extension cannot detect.
+  // selectScraper never throws and falls back deterministically (free) when no
+  // Manifest credential is configured, so the worst case is a fast local
+  // decision, not a failed request.
+  const decision = await selectScraper(c.env, { url, reason: reason ?? null });
+
   const jobId = crypto.randomUUID();
   const now = Math.floor(Date.now() / 1000);
 
   await c.env.DB.prepare(
     `INSERT INTO job_queue (id, job_type, target_type, payload_json, priority, status, run_after,
-                            created_at, updated_at, requested_by_device)
-     VALUES (?, 'scrape', 'extension_backend_request', ?, ?, 'pending', ?, ?, ?, ?)`,
+                            created_at, updated_at, requested_by_device,
+                            provider_selected, provider_select_reason)
+     VALUES (?, 'scrape', 'extension_backend_request', ?, ?, 'pending', ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       jobId,
@@ -463,6 +496,8 @@ deviceRoutes.post('/devices/request-scrape', requireDevice, async (c) => {
       now,
       now,
       device.id,
+      decision.provider,
+      decision.reason.slice(0, 500),
     )
     .run();
 
@@ -470,7 +505,9 @@ deviceRoutes.post('/devices/request-scrape', requireDevice, async (c) => {
     ok({
       job_id: jobId,
       status: 'queued',
-      message: 'Backend scrape requested. AI will select Apify or BrightData.',
+      provider_selected: decision.provider,
+      provider_reason: decision.reason,
+      ai_used: decision.ai_used,
       manual_failure_reason: reason ?? null,
     }),
   );
