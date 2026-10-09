@@ -35,6 +35,12 @@ import { normaliseRoutes } from './routes/normalise';
 import { runnerRoutes } from './routes/runners';
 import { deviceRoutes } from './routes/device';
 import { pipelineRoutes } from './routes/pipeline';
+import { archiveRoutes } from './routes/archive';
+import { nicheRoutes } from './routes/niches';
+import { outreachRoutes } from './routes/outreach';
+import { sheetsRoutes } from './routes/sheets';
+import { notificationsRoutes } from './routes/notifications';
+import { userRoutes } from './routes/users';
 import { CRONS, TRIGGERS, runScheduled, runTick } from './jobs/scheduled';
 import { cancel, enqueue, retry } from './lib/queue';
 import { z } from 'zod';
@@ -119,6 +125,12 @@ app.route('/api', normaliseRoutes);
 app.route('/api', runnerRoutes);
 app.route('/api', deviceRoutes);
 app.route('/api', pipelineRoutes);
+app.route('/api', archiveRoutes);
+app.route('/api', nicheRoutes);
+app.route('/api', outreachRoutes);
+app.route('/api', sheetsRoutes);
+app.route('/api', notificationsRoutes);
+app.route('/api', userRoutes);
 
 app.notFound((c) => {
   const { body, status } = fail('E_NOT_FOUND');

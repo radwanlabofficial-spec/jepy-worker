@@ -14,6 +14,8 @@
 import { claim, enqueue, fail, markRunning, reclaimStale, recordSuccess, recordFailure } from '../lib/queue';
 import { openSecret, sha256Hex } from '../lib/crypto';
 import { testCredential } from '../lib/provider-test';
+import { archiveColdLeads } from './archive';
+import { processVerifyJobs } from './verify';
 import type { Env } from '../env';
 
 /**
@@ -74,6 +76,20 @@ export async function runTick(env: Env, now = new Date()): Promise<string[]> {
   if (hour === 4) {
     await runScheduled(CRONS.retentionPurge, env);
     ran.push('retention_purge');
+    // R2 cold-storage archive: leads older than 90 days move to the jepy-raw
+    // bucket as JSONL, then are marked archived_at so the dashboard's D1
+    // queries stay on hot data. Runs right after the retention purge because
+    // both are destructive-ish data-lifecycle work that belongs in the quiet
+    // hours, and a failure in one must not hide the other — separate cron_runs
+    // rows, separate names. archiveColdLeads is idempotent (archived_at IS
+    // NULL candidate predicate), so a re-run after a partial failure is safe.
+    await record(env, 'r2_archive', () =>
+      archiveColdLeads(env).then((r) => ({
+        dispatched: r.archived,
+        note: r.batches.length > 0 ? r.batches.join(', ') : 'no leads cold enough to archive',
+      })),
+    );
+    ran.push('r2_archive');
   }
   if (day === 1 && hour === 5) {
     await runScheduled(CRONS.reconcile, env);
@@ -211,13 +227,27 @@ async function dispatcher(env: Env): Promise<{ dispatched: number; note?: string
   const paused = await setting(env.DB, 'dispatcher_paused');
   if (paused === 1) return { dispatched: 0, note: 'dispatcher_paused=1 — nothing claimed' };
 
+  const notes: string[] = [];
+
+  // Email verification pipeline: verify jobs declare runner:'verifier' in
+  // their payload, so the dispatcher's own claim(..., 'worker') below skips
+  // them — they are processed here, in-worker, BEFORE the router claim. The
+  // RouterDO would otherwise receive target_type='email_verify' jobs it cannot
+  // route, parking them as needs_manual on every tick. Defensive by design: a
+  // verification failure must never break dispatch of everything else.
+  try {
+    const verified = await processVerifyJobs(env, 25);
+    if (verified.processed > 0) notes.push(`verify:${verified.processed} processed`);
+  } catch (error) {
+    notes.push(`verify:error:${error instanceof Error ? error.message.slice(0, 80) : 'unknown'}`);
+  }
+
   const claimed = await claim(env.DB, 'cron:dispatcher', 5);
-  if (claimed.length === 0) return { dispatched: 0, note: 'queue empty' };
+  if (claimed.length === 0) return { dispatched: 0, note: `queue empty${notes.length > 0 ? ` | ${notes.join(', ')}` : ''}` };
 
   let done = 0;
   let requeued = 0;
   let manual = 0;
-  const notes: string[] = [];
 
   for (const job of claimed) {
     await markRunning(env.DB, job.id);
