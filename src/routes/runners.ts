@@ -35,9 +35,10 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
 import { fail, ok } from '../lib/envelope';
-import { requireAdmin } from '../middleware/auth';
+import { requireActor, requireAdmin } from '../middleware/auth';
 import { claim, complete, fail as failJob } from '../lib/queue';
 import type { RunnerKind } from '../lib/queue';
+import { selectScraper } from '../lib/scraper_select';
 import type { Actor, Env } from '../env';
 
 export const runnerRoutes = new Hono<{ Bindings: Env; Variables: { actor: Actor } }>();
@@ -78,6 +79,68 @@ runnerRoutes.post('/admin/jobs/claim', async (c) => {
   // to the thing that took it rather than to "someone".
   const jobs = await claim(c.env.DB, `runner:${runner}`, limit, runner);
 
+  // AI scraper selection. An extension backend-scrape request arrives from
+  // /devices/request-scrape as job_type='scrape' + target_type=
+  // 'extension_backend_request' (the old 'backend_scrape' job_type was never in
+  // the job_queue CHECK, and job_queue has no target_url column — the URL rides
+  // in payload_json). The selection happens here, at claim time, because the
+  // right provider is a live question (circuit state, today's quota) that a
+  // stored-at-request-time choice would answer wrong by the time the runner
+  // arrives. The decision is written back onto the job row so it is auditable
+  // after the fact. A job that already carries a decision is left alone: the
+  // AI is consulted once per job, not once per claim.
+  //
+  // The whole block is defensive by design. If migration 0014 has not been
+  // applied yet the UPDATE below throws, and a provider choice must never turn
+  // a successful claim into a 500 — so every failure is swallowed and the job
+  // still goes out, undecided, for the runner to fall back on its own default.
+  try {
+    const scrapeJobs = jobs.filter(
+      (job) => job.job_type === 'scrape' && job.target_type === 'extension_backend_request',
+    );
+    if (scrapeJobs.length > 0) {
+      const placeholders = scrapeJobs.map(() => '?').join(',');
+      const rows = (await c.env.DB.prepare(
+        `SELECT id, provider_selected, payload_json
+           FROM job_queue WHERE id IN (${placeholders})`,
+      )
+        .bind(...scrapeJobs.map((job) => job.id))
+        .all<{ id: string; provider_selected: string | null; payload_json: string | null }>()
+      ).results ?? [];
+
+      for (const row of rows) {
+        if (row.provider_selected) continue;
+        const payload = row.payload_json ? safeParse(row.payload_json) : null;
+        const payloadObj = payload && typeof payload === 'object' ? (payload as Record<string, unknown>) : null;
+        const rawUrl =
+          (typeof payloadObj?.url === 'string' && payloadObj.url) ||
+          (typeof payloadObj?.target_url === 'string' && payloadObj.target_url) ||
+          '';
+        if (!rawUrl) continue;
+        try {
+          const decision = await selectScraper(c.env, {
+            url: rawUrl,
+            reason:
+              (typeof payloadObj?.manual_failure_reason === 'string' && payloadObj.manual_failure_reason) ||
+              (typeof payloadObj?.reason === 'string' && payloadObj.reason) ||
+              null,
+          });
+          await c.env.DB.prepare(
+            `UPDATE job_queue SET provider_selected = ?, provider_select_reason = ?, updated_at = unixepoch()
+              WHERE id = ?`,
+          )
+            .bind(decision.provider, decision.reason.slice(0, 500), row.id)
+            .run();
+        } catch {
+          // Per-job: one undecidable URL must not block the rest of the claim.
+        }
+      }
+    }
+  } catch {
+    // Migration 0014 (or the target_url column) not present: the claim still
+    // succeeds and the runner decides on its own.
+  }
+
   return c.json(
     ok({
       runner,
@@ -92,6 +155,25 @@ runnerRoutes.post('/admin/jobs/claim', async (c) => {
       })),
     }),
   );
+});
+
+/**
+ * Manual test hook for the AI scraper selection: `GET /api/scrape/decision?url=`.
+ * Returns exactly what the claim path would write onto an extension
+ * backend-scrape job row, without creating or touching a job. requireActor, because this is a
+ * diagnostic for the operator, not a cost-bearing action — but it does call
+ * Manifest, so it is not public.
+ */
+runnerRoutes.get('/scrape/decision', requireActor, async (c) => {
+  const parsed = z
+    .object({ url: z.string().min(1).max(2000), reason: z.string().max(500).nullish() })
+    .safeParse({ url: c.req.query('url') ?? '', reason: c.req.query('reason') ?? null });
+  if (!parsed.success) {
+    const { body, status } = fail('E_VALIDATION', { reason: 'url query param is required' });
+    return c.json(body, status as 400);
+  }
+  const decision = await selectScraper(c.env, { url: parsed.data.url, reason: parsed.data.reason });
+  return c.json(ok({ url: parsed.data.url, ...decision }));
 });
 
 /** `result_ref` is a pointer, not a payload: an R2 key, a ledger id, a URL. */
