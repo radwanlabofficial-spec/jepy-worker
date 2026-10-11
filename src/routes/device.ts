@@ -273,6 +273,77 @@ deviceRoutes.post('/devices', async (c) => {
   );
 });
 
+/**
+ * Generate a pairing code for extension setup (admin only).
+ * Returns a 6-digit code valid for 5 minutes.
+ */
+deviceRoutes.post('/devices/pairing-code', requireAdmin, async (c) => {
+  const code = String(Math.floor(100000 + Math.random() * 900000));
+  const now = Math.floor(Date.now() / 1000);
+  const expiresAt = now + 300; // 5 minutes
+
+  // Clean up expired codes
+  await c.env.DB.prepare(`DELETE FROM pairing_codes WHERE expires_at < ?`).bind(now).run();
+
+  await c.env.DB.prepare(
+    `INSERT INTO pairing_codes (code, created_at, expires_at) VALUES (?, ?, ?)`
+  ).bind(code, now, expiresAt).run();
+
+  return c.json(ok({ code, expires_at: expiresAt, expires_in_sec: 300 }));
+});
+
+/**
+ * Exchange a pairing code for a device token (extension calls this).
+ * Code is single-use.
+ */
+deviceRoutes.post('/devices/pair', async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  const code = String(body.code ?? '').trim();
+
+  if (!/^\d{6}$/.test(code)) {
+    const { body: eb, status } = fail('E_VALIDATION', 'Invalid pairing code format');
+    return c.json(eb, status as 400);
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const row = await c.env.DB.prepare(
+    `SELECT code, expires_at, used_at FROM pairing_codes WHERE code = ?`
+  ).bind(code).first() as any;
+
+  if (!row) {
+    const { body: eb, status } = fail('E_NOT_FOUND', 'Pairing code not found');
+    return c.json(eb, status as 404);
+  }
+  if (row.used_at) {
+    const { body: eb, status } = fail('E_CONFLICT', 'Pairing code already used');
+    return c.json(eb, status as 409);
+  }
+  if (row.expires_at < now) {
+    const { body: eb, status } = fail('E_EXPIRED', 'Pairing code expired');
+    return c.json(eb, status as 410);
+  }
+
+  // Mark as used
+  await c.env.DB.prepare(`UPDATE pairing_codes SET used_at = ? WHERE code = ?`).bind(now, code).run();
+
+  // Issue device token
+  const { token, hash } = await newDeviceToken();
+  const id = crypto.randomUUID();
+  const label = String(body.device_label ?? 'Chrome Extension').slice(0, 100);
+
+  await c.env.DB.prepare(
+    `INSERT INTO devices (id, device_label, token_hash, mode, current_directive, pack_epoch, status)
+     VALUES (?, ?, ?, 'both', 'run', 0, 'active')`,
+  ).bind(id, label, hash).run();
+
+  return c.json(ok({
+    id,
+    device_label: label,
+    token,
+    note: 'This token is shown once and is stored only as a SHA-256 hash. Copy it now.',
+  }));
+});
+
 deviceRoutes.post('/admin/devices', async (c) => {
   const parsed = issueSchema.safeParse(await c.req.json().catch(() => ({})));
   if (!parsed.success) {
