@@ -274,6 +274,43 @@ deviceRoutes.post('/devices', async (c) => {
 });
 
 /**
+ * Manual capture from extension (Mode A).
+ * Saves the extracted DOM directly to dom_captures without a job.
+ */
+deviceRoutes.post('/devices/captures', requireDevice, async (c) => {
+  const device = c.get('device');
+  const body = await c.req.json().catch(() => ({}));
+
+  const url = String(body.url ?? '').slice(0, 2000);
+  const dom = body.dom;
+
+  if (!url && dom === undefined) {
+    const { body: eb, status } = fail('E_VALIDATION', 'url or dom required');
+    return c.json(eb, status as 400);
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const id = crypto.randomUUID();
+
+  await c.env.DB.prepare(
+    `INSERT INTO dom_captures (id, job_id, capture_batch_id, device_id, mode, url, extracted_json, pack_version, duration_ms, created_at)
+     VALUES (?, NULL, NULL, ?, 'a', ?, ?, ?, ?, ?)`,
+  )
+    .bind(
+      id,
+      device.id,
+      url || null,
+      JSON.stringify(dom ?? null),
+      1,
+      0,
+      now,
+    )
+    .run();
+
+  return c.json(ok({ id, message: 'Capture saved' }));
+});
+
+/**
  * Generate a pairing code for extension setup.
  * Allows admin or console-open access (low-risk: 5-min single-use code).
  */
