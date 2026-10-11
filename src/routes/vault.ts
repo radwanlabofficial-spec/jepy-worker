@@ -446,18 +446,16 @@ vaultRoutes.get('/vault/apify-usage', async (c) => {
 
       // Fetch monthly usage from the usage endpoint
       let usage = null;
-      if (userId) {
-        try {
-          const uRes = await fetch(
-            `https://api.apify.com/v2/users/${userId}/usage/monthly?token=${encodeURIComponent(secret)}`,
-            { signal: controller.signal },
-          );
-          if (uRes.ok) {
-            const uBody = (await uRes.json()) as any;
-            usage = uBody.data ?? uBody;
-          }
-        } catch { /* usage optional */ }
-      }
+      try {
+        const uRes = await fetch(
+          `https://api.apify.com/v2/users/me/usage/monthly?token=${encodeURIComponent(secret)}`,
+          { signal: controller.signal },
+        );
+        if (uRes.ok) {
+          const uBody = (await uRes.json()) as any;
+          usage = uBody.data ?? uBody;
+        }
+      } catch { /* usage optional */ }
 
       results.push({
         account_label: row.account_label,
