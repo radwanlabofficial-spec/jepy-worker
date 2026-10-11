@@ -274,10 +274,16 @@ deviceRoutes.post('/devices', async (c) => {
 });
 
 /**
- * Generate a pairing code for extension setup (admin only).
- * Returns a 6-digit code valid for 5 minutes.
+ * Generate a pairing code for extension setup.
+ * Allows admin or console-open access (low-risk: 5-min single-use code).
  */
-deviceRoutes.post('/devices/pairing-code', requireAdmin, async (c) => {
+deviceRoutes.post('/devices/pairing-code', async (c) => {
+  const { resolveActor } = await import('../middleware/auth');
+  const actor = await resolveActor(c as any);
+  if (!actor || (actor.kind !== 'admin' && actor.kind !== 'access')) {
+    const { body, status } = fail('E_FORBIDDEN', 'এই কাজের অনুমতি নেই');
+    return c.json(body, status as 403);
+  }
   const code = String(Math.floor(100000 + Math.random() * 900000));
   const now = Math.floor(Date.now() / 1000);
   const expiresAt = now + 300; // 5 minutes
